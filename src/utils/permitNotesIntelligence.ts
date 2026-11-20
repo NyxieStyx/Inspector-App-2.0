@@ -522,8 +522,9 @@ export function getLifecycleAwareQuickPills(
 /**
  * Formats raw spoken or typed inspector observations into clean MCDOT narrative style:
  * - Collapses repeating speech recognition phrases
- * - Standardizes MCDOT civil terms (MAG Detail 250, 48" cover, 1/2-sack CLSM, MAG Detail 200-1, TCP, forms check, concrete pour)
- * - Prefixes field site observations with "Site visit performed. " when appropriate
+ * - Strips only isolated hesitation fillers (um, uh, erm) while preserving meaningful words like "like"
+ * - Standardizes MCDOT civil terms (MAG Detail 250, 48" cover, 1/2-sack CLSM, MAG Detail 200-1, TCP)
+ * - Never blindly prepends "Site visit performed." so verbatim transcripts remain accurate
  */
 export function formatMcdotFieldDictation(
   rawText: string,
@@ -533,11 +534,9 @@ export function formatMcdotFieldDictation(
 
   let cleaned = removeDuplicatePhrases(rawText.trim());
 
-  // Strip conversational fillers
-  cleaned = cleaned.replace(
-    /\b(um|uh|erm|like|you know|so yeah|basically|sort of|kind of|i guess)\b/gi,
-    ''
-  );
+  // Strip only isolated hesitation fillers (um, uh, erm); preserve meaningful words like "like"
+  cleaned = cleaned.replace(/(?:^|\s)(?:um+|uh+|erm+)(?=[,\s.!?]|$)/gi, ' ');
+  cleaned = cleaned.replace(/\s+([,.;!?])/g, '$1');
   cleaned = removeDuplicatePhrases(cleaned);
 
   // Strip accidental date or inspector prefix/suffix
@@ -554,13 +553,6 @@ export function formatMcdotFieldDictation(
   }
   if (/^permit\s+closed[.]?$/i.test(cleaned)) {
     return MCDOT_STANDARD_NOTE_ENTRIES.CLOSED;
-  }
-  if (
-    /^(?:site\s+visit(?:\s+performed)?[\s,.-]*)?(?:no\s+work\s+(?:taking\s+place|in\s+progress|on\s+site)|no\s+crew(?:\s+observed)?(?:\s+on\s+site)?(?:\s+working)?|no\s+one\s+on\s+site|nobody\s+(?:on\s+site|working))[.]?$/i.test(
-      cleaned
-    )
-  ) {
-    return MCDOT_STANDARD_NOTE_ENTRIES.NO_CREW;
   }
   if (/^final\s+(?:site\s+)?check(?:\s+performed)?[.]?$/i.test(cleaned)) {
     return MCDOT_STANDARD_NOTE_ENTRIES.FINAL_CHECK;
@@ -583,21 +575,11 @@ export function formatMcdotFieldDictation(
     .replace(/\bmcdot\b/gi, 'MCDOT')
     .replace(/\brow\b/g, 'ROW');
 
-  // Ensure capital first letter and period at end
+  // Ensure capital first letter and period at end without inventing unstated prefixes
   cleaned = cleaned.replace(/\s{2,}/g, ' ').trim();
   cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
   if (!/[.!?]$/.test(cleaned)) {
     cleaned = `${cleaned}.`;
-  }
-
-  // Prepend "Site visit performed. " if it's a field observation that doesn't already start with a standard log lead-in
-  const alreadyHasLeadIn =
-    /^(?:site\s+visit\s+performed|permit\s+logged|permit\s+closed|tcp\s+approved|on-?site\s+pre-?con|phone\s+pre-?con|pre-?con(?:struction)?\s+(?:meeting|held|conducted)|final\s+site\s+check|spoke\s+with|called\b|received\b|emailed\b)/i.test(
-      cleaned
-    );
-
-  if (!alreadyHasLeadIn) {
-    cleaned = `Site visit performed. ${cleaned}`;
   }
 
   return cleaned;

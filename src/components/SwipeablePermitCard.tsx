@@ -174,6 +174,14 @@ export default function SwipeablePermitCard({
             <span className={`w-2 h-2 rounded-full shrink-0 ${severityMeta.dotClass}`} />
             <span>{severityMeta.label}</span>
           </span>
+          {(statusInfo.ritBadgeLabel === 'Expired' || statusInfo.ritBadgeLabel === 'Unknown') && (
+            <span
+              className={`px-1.5 py-0.5 rounded border text-[11px] font-black leading-none ${statusInfo.ritBadgeClass}`}
+              title={statusInfo.ritTooltip}
+            >
+              {statusInfo.ritBadgeLabel}
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
@@ -210,10 +218,14 @@ export default function SwipeablePermitCard({
       <div className="flex items-center justify-between gap-2.5 pl-3 pr-1.5 py-1.5 rounded-xl bg-zinc-100 dark:bg-slate-900 border-2 border-zinc-300 dark:border-slate-700">
         <div className="min-w-0 flex-1 truncate text-xs sm:text-sm text-[#09090B] dark:text-slate-100">
           <span className="font-black">{resolvedContact.companyName}</span>
-          <span className="text-zinc-400 mx-1.5">·</span>
-          <span className="font-bold text-zinc-700 dark:text-slate-300">
-            {resolvedContact.contactName || 'Supt.'}
-          </span>
+          {resolvedContact.contactName && (
+            <>
+              <span className="text-zinc-400 mx-1.5">·</span>
+              <span className="font-bold text-zinc-700 dark:text-slate-300">
+                {resolvedContact.contactName}
+              </span>
+            </>
+          )}
         </div>
 
         {resolvedContact.cleanPhone && (
@@ -284,7 +296,9 @@ export default function SwipeablePermitCard({
             <span className="font-black text-[#09090B] dark:text-white">
               Quick Field Verification
             </span>
-            <span className="font-mono font-bold truncate">{permit.workWindow}</span>
+            <span className="font-mono font-bold truncate">
+              {permit.workWindow || 'Not Listed in GIS'}
+            </span>
           </div>
 
           <div className="space-y-1.5">

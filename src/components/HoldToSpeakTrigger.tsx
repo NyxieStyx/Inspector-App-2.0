@@ -23,7 +23,7 @@ interface HoldToSpeakModalProps {
 }
 
 function getSimulatedVoiceSamples(permit: Permit | null): Array<{ label: string; speech: string }> {
-  const supt = permit?.contractorContact || 'Cody Miller';
+  const supt = permit?.contractorContact || 'the site superintendent';
   if (permit?.permitType === 'Driveway Access') {
     return [
       {
@@ -195,7 +195,7 @@ export default function HoldToSpeakModal({
           tcNumber: activePermit.tcNumber,
           permitType: activePermit.permitType,
           location: activePermit.location,
-          contractor: activePermit.contractor,
+          contractor: activePermit.contractor || 'Not Listed in GIS',
           lat: currentGps.lat,
           lng: currentGps.lng,
           checkedItems: checkedItemLabels,

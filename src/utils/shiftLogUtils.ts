@@ -95,7 +95,7 @@ export function formatShiftSummaryText(records: VisitedPermitRecord[]): string {
     const stage = inferPermitLifecycleStage(rec.noteFile.inspectorNotes);
     output += `[STOP #${idx + 1}] PERMIT: ${rec.permit.tcNumber} (${stage})\n`;
     output += `  Location: ${rec.permit.location}\n`;
-    output += `  Contractor: ${rec.permit.contractor}\n`;
+    output += `  Contractor: ${rec.permit.contractor || 'Not Listed in GIS'}\n`;
     output += `  Scope / Type: ${rec.permit.permitType} (${rec.permit.projectTitle})\n`;
     output += `  Chronological Notes Logged Today:\n`;
 
@@ -207,7 +207,7 @@ export async function downloadShiftLogDocx(records: VisitedPermitRecord[]) {
             font: 'Calibri',
           }),
           new TextRun({
-            text: `${rec.permit.contractor}`,
+            text: `${rec.permit.contractor || 'Not Listed in GIS'}`,
             size: 18,
             font: 'Calibri',
           }),

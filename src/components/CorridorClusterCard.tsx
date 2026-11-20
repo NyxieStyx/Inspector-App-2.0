@@ -101,10 +101,14 @@ export default function CorridorClusterCard({
         <div className="flex items-center justify-between gap-2.5 pl-3 pr-1.5 py-1.5 rounded-xl bg-zinc-100 dark:bg-slate-900 border-2 border-zinc-300 dark:border-slate-700">
           <div className="min-w-0 flex-1 truncate text-xs sm:text-sm text-[#09090B] dark:text-slate-100">
             <span className="font-black">{cluster.contractorDisplay}</span>
-            <span className="text-zinc-400 mx-1.5">·</span>
-            <span className="font-bold text-zinc-700 dark:text-slate-300">
-              {cluster.resolvedContact.contactName || 'Corridor Supt.'}
-            </span>
+            {cluster.resolvedContact.contactName && (
+              <>
+                <span className="text-zinc-400 mx-1.5">·</span>
+                <span className="font-bold text-zinc-700 dark:text-slate-300">
+                  {cluster.resolvedContact.contactName}
+                </span>
+              </>
+            )}
           </div>
 
           {cluster.resolvedContact.cleanPhone && (

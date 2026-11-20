@@ -55,6 +55,13 @@ import {
   buildMcdotPreConParagraph,
 } from '../utils/permitNotesIntelligence';
 import { compressImage } from '../utils/imageCompressor';
+import {
+  savePhotoBlob,
+  getPhotoBlob,
+  deletePhotoBlob,
+  enqueueOfflineSync,
+  clearOfflineSyncByTcNumber,
+} from '../services/offlineStorage';
 import { searchMagMcdotSpecs } from '../data/magMcdotSpecsData';
 import GoogleClientIdModal from './GoogleClientIdModal';
 import {
@@ -234,8 +241,45 @@ export default function PermitDetailModal({
   );
   const [isImportingTemplate, setIsImportingTemplate] = useState(false);
   const [isReauthorizing, setIsReauthorizing] = useState(false);
+  const [photoObjectUrls, setPhotoObjectUrls] = useState<Record<string, string>>({});
   const templateFileInputRef = useRef<HTMLInputElement>(null);
   const notesEndRef = useRef<HTMLDivElement>(null);
+
+  // Hydrate photo preview object URLs from IndexedDB Blobs and revoke cleanly on unmount/change
+  useEffect(() => {
+    let cancelled = false;
+    const createdUrls: string[] = [];
+    const photos = noteFile.photos || [];
+
+    async function loadPhotoUrls() {
+      const nextMap: Record<string, string> = {};
+      for (const p of photos) {
+        if (p.dataUrl) {
+          nextMap[p.id] = p.dataUrl;
+          continue;
+        }
+        const blob = await getPhotoBlob(p.id);
+        if (cancelled) return;
+        if (blob) {
+          const objUrl = URL.createObjectURL(blob);
+          createdUrls.push(objUrl);
+          nextMap[p.id] = objUrl;
+        }
+      }
+      if (!cancelled) {
+        setPhotoObjectUrls(nextMap);
+      }
+    }
+
+    void loadPhotoUrls();
+
+    return () => {
+      cancelled = true;
+      for (const url of createdUrls) {
+        URL.revokeObjectURL(url);
+      }
+    };
+  }, [noteFile.photos, permit.tcNumber]);
 
   // In-place chronological note editing & delete confirmation state
   const [editingEntryId, setEditingEntryId] = useState<string | null>(null);
@@ -519,12 +563,13 @@ export default function PermitDetailModal({
           setNoteFile(unsyncedLatest);
           noteFileRef.current = unsyncedLatest;
           saveLocalPermitNote(unsyncedLatest);
+          void enqueueOfflineSync(nextPermit.tcNumber, 'NOTE', { tcNumber: nextPermit.tcNumber });
           setDriveStatus('unsynced');
           setDriveError(null);
           onShowToast?.(
             nextLabel
-              ? `${nextLabel} (Saved locally — click "Connect Drive" or "Save & Sync to Spark Notes")`
-              : 'Saved locally — click "Connect Drive" or "Save & Sync to Spark Notes"',
+              ? `${nextLabel} (Saved locally & queued for Drive sync)`
+              : 'Saved locally & queued for Drive sync',
             'info'
           );
           break;
@@ -544,11 +589,17 @@ export default function PermitDetailModal({
             setNoteFile(unsyncedLatest);
             noteFileRef.current = unsyncedLatest;
             saveLocalPermitNote(unsyncedLatest);
+            void enqueueOfflineSync(
+              nextPermit.tcNumber,
+              'NOTE',
+              { tcNumber: nextPermit.tcNumber },
+              'Google Drive session expired'
+            );
             setDriveStatus('unsynced');
             setDriveError('Google Drive session expired. Click Connect Drive to sync.');
             onAccessTokenUpdated?.('');
             onShowToast?.(
-              'Saved locally — click "Connect Drive" or "Save & Sync to Spark Notes" to authorize Drive.',
+              'Saved locally & queued — click "Connect Drive" to sync.',
               'warning'
             );
             break;
@@ -583,6 +634,9 @@ export default function PermitDetailModal({
           setNoteFile(reconciledNoteFile);
           noteFileRef.current = reconciledNoteFile;
           saveLocalPermitNote(reconciledNoteFile);
+          if (!hasNewerLocalEdits) {
+            void clearOfflineSyncByTcNumber(nextPermit.tcNumber);
+          }
           setDriveSyncInfo({
             ...syncSummary,
             noteFile: reconciledNoteFile,
@@ -607,6 +661,12 @@ export default function PermitDetailModal({
           setNoteFile(unsyncedLatest);
           noteFileRef.current = unsyncedLatest;
           saveLocalPermitNote(unsyncedLatest);
+          void enqueueOfflineSync(
+            nextPermit.tcNumber,
+            'NOTE',
+            { tcNumber: nextPermit.tcNumber },
+            err?.message || 'Drive sync failed'
+          );
 
           setDriveStatus('error');
           setDriveError(err.message || 'Auto-sync to Google Drive failed');
@@ -616,7 +676,7 @@ export default function PermitDetailModal({
             onAccessTokenUpdated?.('');
             onShowToast?.('Drive authorization needed — click Connect Drive', 'warning');
           } else {
-            onShowToast?.(`Saved locally. Drive sync error: ${err.message || 'Error'}`, 'warning');
+            onShowToast?.(`Saved locally & queued for retry. Drive sync error: ${err.message || 'Error'}`, 'warning');
           }
           break;
         }
@@ -659,7 +719,13 @@ export default function PermitDetailModal({
     localRevisionRef.current += 1;
     setNoteFile(updatedFile);
     noteFileRef.current = updatedFile;
-    saveLocalPermitNote(updatedFile);
+    const localSaveResult = saveLocalPermitNote(updatedFile);
+    if (!localSaveResult.ok) {
+      onShowToast?.(
+        localSaveResult.error || 'Storage full — export or sync logs now',
+        'warning'
+      );
+    }
     onPermitUpdated({ ...targetPermit });
 
     // 2. Enqueue serialized Google Drive PATCH sync
@@ -1312,7 +1378,7 @@ export default function PermitDetailModal({
     }
   };
 
-  // Site photo attachment
+  // Site photo attachment (persisted as Blob in IndexedDB; lightweight metadata only in localStorage)
   const handlePhotoSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -1320,25 +1386,49 @@ export default function PermitDetailModal({
     setIsCompressingPhoto(true);
     try {
       const compressed = await compressImage(file, 1280, 0.82);
+      const photoId = `photo-${Date.now()}`;
+
+      // 1. Persist binary Blob in IndexedDB first
+      const idbResult = await savePhotoBlob(photoId, compressed.blob);
+      if (!idbResult.ok) {
+        onShowToast?.(
+          idbResult.error || 'Storage full — export or sync logs now',
+          'warning'
+        );
+        return;
+      }
+
+      // 2. Store only lightweight photo metadata/ID reference in permit note state
       const newPhoto: PermitPhoto = {
-        id: `photo-${Date.now()}`,
+        id: photoId,
         timestamp: new Date().toISOString(),
         category: 'general',
         caption: photoCaption.trim() || `Site Photo — ${formatMcdotDate(new Date())}`,
-        dataUrl: compressed.dataUrl,
+        storedInIdb: true,
         fileSizeKb: compressed.fileSizeKb,
       };
+      const prevFile = noteFileRef.current;
       const updatedFile: PermitNoteFile = {
-        ...noteFileRef.current,
-        photos: [newPhoto, ...(noteFileRef.current.photos || [])],
+        ...prevFile,
+        photos: [newPhoto, ...(prevFile.photos || [])],
       };
+
+      const saveResult = saveLocalPermitNote(updatedFile);
+      if (!saveResult.ok) {
+        await deletePhotoBlob(photoId);
+        onShowToast?.(
+          saveResult.error || 'Storage full — export or sync logs now',
+          'warning'
+        );
+        return;
+      }
+
       setNoteFile(updatedFile);
       noteFileRef.current = updatedFile;
-      saveLocalPermitNote(updatedFile);
       setPhotoCaption('');
-      onShowToast?.('Site photo compressed & saved', 'success');
+      onShowToast?.(`Site photo compressed (${compressed.fileSizeKb} KB) & saved`, 'success');
     } catch (err: any) {
-      onShowToast?.(`Photo compression failed: ${err.message}`, 'warning');
+      onShowToast?.(`Photo save failed: ${err?.message || 'Unknown error'}`, 'warning');
     } finally {
       setIsCompressingPhoto(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -1666,7 +1756,7 @@ export default function PermitDetailModal({
                 <span className="text-xs text-slate-800 font-medium">
                   Contractor:{' '}
                   <strong className="text-gray-900 font-bold">
-                    {permit.contractor || 'Permittee'}
+                    {permit.contractor || 'Not Listed in GIS'}
                   </strong>
                   <span className="text-slate-700 hidden sm:inline">
                     {' '}
@@ -2113,38 +2203,48 @@ export default function PermitDetailModal({
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
-                {noteFile.photos.map((photo) => (
-                  <div
-                    key={photo.id}
-                    className="bg-white border border-slate-300 rounded-xl overflow-hidden flex flex-col shadow-sm"
-                  >
-                    <img
-                      src={photo.dataUrl}
-                      alt={photo.caption}
-                      className="aspect-video object-cover w-full"
-                    />
-                    <div className="p-2.5 flex items-center justify-between gap-2 text-xs">
-                      <span className="text-gray-900 font-semibold truncate">{photo.caption}</span>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          const updated = {
-                            ...noteFileRef.current,
-                            photos: noteFileRef.current.photos.filter((p) => p.id !== photo.id),
-                          };
-                          setNoteFile(updated);
-                          noteFileRef.current = updated;
-                          saveLocalPermitNote(updated);
-                        }}
-                        className="min-w-[44px] min-h-[44px] p-3 rounded-xl text-rose-700 hover:text-rose-800 hover:bg-rose-50 flex items-center justify-center cursor-pointer shrink-0"
-                        title="Remove photo"
+                {noteFile.photos.map((photo) => {
+                  const previewSrc = photoObjectUrls[photo.id] || photo.dataUrl || '';
+                  return (
+                    <div
+                      key={photo.id}
+                      className="bg-white border border-slate-300 rounded-xl overflow-hidden flex flex-col shadow-sm"
+                    >
+                      {previewSrc ? (
+                        <img
+                          src={previewSrc}
+                          alt={photo.caption}
+                          className="aspect-video object-cover w-full"
+                        />
+                      ) : (
+                        <div className="aspect-video w-full bg-slate-100 flex items-center justify-center text-xs font-semibold text-slate-500">
+                          Loading photo...
+                        </div>
+                      )}
+                      <div className="p-2.5 flex items-center justify-between gap-2 text-xs">
+                        <span className="text-gray-900 font-semibold truncate">{photo.caption}</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const updated = {
+                              ...noteFileRef.current,
+                              photos: noteFileRef.current.photos.filter((p) => p.id !== photo.id),
+                            };
+                            setNoteFile(updated);
+                            noteFileRef.current = updated;
+                            saveLocalPermitNote(updated);
+                            void deletePhotoBlob(photo.id);
+                          }}
+                          className="min-w-[44px] min-h-[44px] p-3 rounded-xl text-rose-700 hover:text-rose-800 hover:bg-rose-50 flex items-center justify-center cursor-pointer shrink-0"
+                          title="Remove photo"
                         aria-label="Remove photo"
                       >
                         <Trash2 className="w-4 h-4" />
                       </button>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}

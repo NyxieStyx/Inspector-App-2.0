@@ -81,34 +81,65 @@ export function extractPrimaryCorridor(permit: Permit): { key: string; label: st
   };
 }
 
-/**
- * Normalizes contractor company strings so "Team Fishel / Utility Fiber Services"
- * and "Corning Optical / Team Fishel" or "Team Fishel" cluster together cleanly.
- */
-export function normalizeContractorClusterKey(companyName: string): {
+const CONTRACTOR_NORMALIZATION_RULES: Array<{
+  pattern: RegExp;
   key: string;
   shortName: string;
+}> = [
+  { pattern: /\b(team\s+fishel|fishel)\b/i, key: 'team-fishel', shortName: 'Team Fishel' },
+  {
+    pattern: /\b(salt\s+river\s+project|salt\s+river|srp|michels(\s+power)?)\b/i,
+    key: 'srp',
+    shortName: 'SRP',
+  },
+  {
+    pattern: /\b(arizona\s+public\s+service|aps|henkels(\s*&\s*mccoy)?)\b/i,
+    key: 'aps',
+    shortName: 'APS',
+  },
+  {
+    pattern: /\b(southwest\s+gas|swg|npl(\s+construction)?)\b/i,
+    key: 'swg-npl',
+    shortName: 'Southwest Gas',
+  },
+  {
+    pattern: /\b(cox\s+communications|cox|csw(\s+contractors)?)\b/i,
+    key: 'cox',
+    shortName: 'Cox',
+  },
+  {
+    pattern: /\b(lumen(\s+technologies)?|centurylink|b&f(\s+contracting)?)\b/i,
+    key: 'lumen',
+    shortName: 'Lumen',
+  },
+  {
+    pattern: /\bepcor(\s+water)?\b/i,
+    key: 'epcor',
+    shortName: 'EPCOR',
+  },
+];
+
+const UNLISTED_CONTRACTOR_PATTERN = /^(not\s+listed(\s+in\s+gis)?|unknown|n\/a|none|tbd|permittee)?$/i;
+
+/**
+ * Normalizes contractor company strings using word-boundary matching so
+ * "COX COMMUNICATIONS" maps to "Cox" and "ARIZONA PUBLIC SERVICE" maps to "APS"
+ * without misgrouping "Wilcox Paving" as Cox or "Perhaps Concrete" as APS.
+ */
+export function normalizeContractorClusterKey(companyName?: string | null): {
+  key: string;
+  shortName: string;
+  isUnlisted: boolean;
 } {
   const raw = (companyName || '').trim();
-  const lower = raw.toLowerCase();
+  if (!raw || UNLISTED_CONTRACTOR_PATTERN.test(raw)) {
+    return { key: '__unlisted__', shortName: 'Not Listed in GIS', isUnlisted: true };
+  }
 
-  if (lower.includes('team fishel') || lower.includes('fishel')) {
-    return { key: 'team-fishel', shortName: 'Team Fishel' };
-  }
-  if (lower.includes('michels') || lower.includes('salt river') || lower.includes('srp')) {
-    return { key: 'srp-michels', shortName: 'SRP / Michels Power' };
-  }
-  if (lower.includes('henkels') || lower.includes('aps') || lower.includes('arizona public')) {
-    return { key: 'aps-henkels', shortName: 'APS / Henkels & McCoy' };
-  }
-  if (lower.includes('southwest gas') || lower.includes('npl')) {
-    return { key: 'swg-npl', shortName: 'Southwest Gas / NPL' };
-  }
-  if (lower.includes('cox') || lower.includes('csw')) {
-    return { key: 'cox-csw', shortName: 'Cox / CSW Contractors' };
-  }
-  if (lower.includes('lumen') || lower.includes('centurylink') || lower.includes('b&f')) {
-    return { key: 'lumen-bf', shortName: 'Lumen / B&F Contracting' };
+  for (const rule of CONTRACTOR_NORMALIZATION_RULES) {
+    if (rule.pattern.test(raw)) {
+      return { key: rule.key, shortName: rule.shortName, isUnlisted: false };
+    }
   }
 
   const base = raw
@@ -118,8 +149,9 @@ export function normalizeContractorClusterKey(companyName: string): {
     .trim();
 
   return {
-    key: (base || 'permittee').toLowerCase(),
-    shortName: raw || 'Permittee',
+    key: (base || raw).toLowerCase(),
+    shortName: raw,
+    isUnlisted: false,
   };
 }
 
@@ -161,7 +193,10 @@ export function buildSmartCorridorFeed(
     );
     const contractorNorm = normalizeContractorClusterKey(resolvedContact.companyName);
 
-    const groupKey = `${corridor.key}::${contractorNorm.key}`;
+    // Do not cluster permits with missing/unlisted GIS contractor into a shared corridor group
+    const groupKey = contractorNorm.isUnlisted
+      ? `${corridor.key}::unlisted::${permit.id}`
+      : `${corridor.key}::${contractorNorm.key}`;
     const existingList = bucketsByKey.get(groupKey) || [];
 
     // Attach to an existing spatial bucket on the same corridor if within 4.0 miles

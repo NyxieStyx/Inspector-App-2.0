@@ -9,9 +9,9 @@ export interface Permit {
   id: string;
   tcNumber: string; // Unique Maricopa County Traffic Control / ROW permit number
   projectTitle: string;
-  contractor: string;
-  contractorContact?: string;
-  contractorPhone?: string;
+  contractor: string | null;
+  contractorContact?: string | null;
+  contractorPhone?: string | null;
   inspectorName?: string;
   location: string;
   milepost?: string;
@@ -31,12 +31,13 @@ export interface Permit {
     | 'Completed'
     | 'Expired'
     | 'Denied'
-    | 'Withdrawn';
-  issueDate: string;
-  expirationDate: string;
-  workWindow: string;
+    | 'Withdrawn'
+    | 'Unknown';
+  issueDate: string | null;
+  expirationDate: string | null;
+  workWindow: string | null;
   preConDate?: string;
-  preConCompleted: boolean;
+  preConCompleted: boolean | null;
   hasSignInSheet: boolean;
   hasBusinessCards: boolean;
   trafficControlPlan: string;
@@ -81,7 +82,9 @@ export interface PermitPhoto {
     | 'paving'
     | 'general';
   caption: string;
-  dataUrl: string; // Compressed base64 image
+  /** Optional inline preview/legacy base64; new photos persist binary Blob in IndexedDB keyed by id */
+  dataUrl?: string;
+  storedInIdb?: boolean;
   fileSizeKb: number;
   driveFileId?: string;
 }

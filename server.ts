@@ -124,33 +124,10 @@ Filter this pre-construction meeting record. Omit general conversation and extra
     }
 
     if (!generatedText) {
-      // Clean fallback if API key is not present in local test
-      generatedText = `### MCDOT Pre-Construction Meeting Record: ${tcNumber}
-**Project:** ${projectTitle || 'Right-of-Way Construction'}
-**Contractor:** ${contractor || 'Field Contractor'}
-*(Processed with Maricopa County Transportation Guidelines)*
-
-#### 1. Executive Summary
-Pre-construction review conducted for Right-of-Way Permit **${tcNumber}**. All field operations must conform to Maricopa County Uniform Standard Specifications and MAG standards.
-
-#### 2. Contractor Questions & County Answers
-- **Q:** *Can steel plating remain overnight on collector street lane?*
-  - **A:** Plating is permitted only if recessed flush or ramped with 1:12 cold mix asphalt, pinned with rebar, and skid-resistant coated.
-- **Q:** *Are Saturday working hours permitted?*
-  - **A:** Weekend work requires 48-hour prior notification to MCDOT Dispatch and approved noise variance.
-
-#### 3. MCDOT Technical Requirements & Restrictions
-- Approved work window: 8:30 AM - 3:30 PM (No arterial lane closures during peak hours).
-- Dust Control: Maricopa Air Quality Department Rule 310 compliance mandatory; water truck on site.
-- Compaction: 95% standard proctor density certified by accredited geotechnical testing lab.
-
-#### 4. Traffic Control & Barricade Specifications
-- MUTCD Type II barricades every 25 ft along trench line.
-- ADA compliant temporary sidewalk ramp with audible pedestrian warnings.
-
-#### 5. Milestones & Restoration
-- Trench backfill inspection: 48 hrs before asphalt cap.
-- Permanent 2-inch asphalt overlay restoration within 14 calendar days of backfill.`;
+      return res.status(503).json({
+        success: false,
+        error: 'AI unavailable offline',
+      });
     }
 
     res.json({
@@ -194,13 +171,12 @@ app.post('/api/gemini/clean-voice-note', async (req, res) => {
 "${rawTranscript}"
 
 INSTRUCTIONS:
-1. Strip all conversational filler words ("uh", "um", "like", "you know", "yeah", "basically", repeated stutter words). Collapse any repeating phrase loops or audio echo artifacts into a single concise statement.
+1. Strip only hesitation filler words ("uh", "um", "erm") and repeated stutter words. Do NOT strip meaningful words such as "like". Collapse any repeating phrase loops or audio echo artifacts into a single concise statement.
 2. Do NOT include any date or "MAC," prefix in "plainCleanText" (that prefix is added automatically).
-3. Format raw speech into clean, concise, chronological MCDOT narrative style matching official Permit Notes logs:
-   - Begin field site observations with "Site visit performed. " (unless the note is "Permit logged.", "TCP approved.", "Permit closed.", "Final site check performed...", or an "On-site/Phone pre-construction meeting..." entry).
-   - No crew / nobody working: "Site visit performed. No crew observed on site working."
-   - Driveway forms / pour: Reference MAG Detail 250 where applicable (e.g., neat straight saw-cut along existing asphalt edge, concrete poured directly against existing asphalt with no expansion joint, positive drainage sloping away from roadway, forms inspection / concrete pour).
-   - Underground utility / trench / bore: Reference 48" minimum cover (or stated depth) and 1/2-sack CLSM slurry backfill within 8 feet of edge of pavement per MAG Detail 200-1 where applicable.
+3. Format raw speech into clean, concise, chronological MCDOT narrative style matching official Permit Notes logs WITHOUT inventing unstated visits or facts:
+   - Never prepend "Site visit performed." if the inspector states no site visit occurred (e.g., rain, phone call, office update). Preserve the exact factual meaning of the dictation.
+   - Driveway forms / pour: Reference MAG Detail 250 only if mentioned in the dictation.
+   - Underground utility / trench / bore: Preserve stated depths, cover, and CLSM backfill details verbatim.
    - Preserve all spoken contact names, companies, phone numbers (formatted as (XXX) XXX-XXXX), stationing, and measurements verbatim so downstream contact extraction works reliably.
 4. Return a JSON object with:
    - "plainCleanText": The polished MCDOT narrative sentence(s) ready to follow "MM/DD/YYYY MAC, "`,
@@ -237,26 +213,22 @@ INSTRUCTIONS:
 
     {
       // Deterministic MCDOT narrative fallback when offline or API key unavailable
+      // Preserves verbatim inspector phrasing; strips only isolated hesitation fillers (um, uh, erm)
       let deduped = rawTranscript;
       for (let pass = 0; pass < 5; pass++) {
         deduped = deduped.replace(/\b((?:[\w'-]+\s+){1,10}[\w'-]+)[,.]?\s+\1\b/gi, '$1');
         deduped = deduped.replace(/\b([\w'-]+)(?:\s+\1\b)+/gi, '$1');
       }
       let cleanFallback = deduped
-        .replace(/\b(um|uh|erm|like|you know|so yeah|basically|sort of|kind of)\b/gi, '')
+        .replace(/(?:^|\s)(?:um+|uh+|erm+)(?=[,\s.!?]|$)/gi, ' ')
         .replace(/^\[?\d{1,2}\/\d{1,2}\/\d{2,4}\]?\s*(?:[–—-]\s*)?(?:MAC,?\s*)?/i, '')
         .replace(/^MAC,?\s*/i, '')
         .replace(/\s*[–—-]\s*MAC\.?\s*$/i, '')
+        .replace(/\s+([,.;!?])/g, '$1')
         .replace(/\s{2,}/g, ' ')
         .trim();
 
-      if (
-        /^(?:site\s+visit(?:\s+performed)?[\s,.-]*)?(?:no\s+work\s+(?:taking\s+place|in\s+progress|on\s+site)|no\s+crew(?:\s+observed)?(?:\s+on\s+site)?(?:\s+working)?|no\s+one\s+on\s+site|nobody\s+(?:on\s+site|working))[.]?$/i.test(
-          cleanFallback
-        )
-      ) {
-        cleanFallback = 'Site visit performed. No crew observed on site working.';
-      } else if (/^permit\s+logged[.]?$/i.test(cleanFallback)) {
+      if (/^permit\s+logged[.]?$/i.test(cleanFallback)) {
         cleanFallback = 'Permit logged.';
       } else if (/^(?:tcp\s+approved|traffic\s+control\s+plan\s+approved)[.]?$/i.test(cleanFallback)) {
         cleanFallback = 'TCP approved.';
@@ -265,7 +237,7 @@ INSTRUCTIONS:
       } else if (/^final\s+(?:site\s+)?check(?:\s+performed)?[.]?$/i.test(cleanFallback)) {
         cleanFallback =
           'Final site check performed. Confirmed work completed to MCDOT standard within county right-of-way.';
-      } else {
+      } else if (cleanFallback) {
         cleanFallback = cleanFallback
           .replace(/^site\s+visit\s+performed\s+(?=[a-z0-9])/i, 'Site visit performed. ')
           .replace(/\bmag\s*(?:detail\s*)?250\b/gi, 'MAG Detail 250')
@@ -289,13 +261,6 @@ INSTRUCTIONS:
         cleanFallback = cleanFallback.charAt(0).toUpperCase() + cleanFallback.slice(1);
         if (!/[.!?]$/.test(cleanFallback)) {
           cleanFallback = `${cleanFallback}.`;
-        }
-        const alreadyHasLeadIn =
-          /^(?:site\s+visit\s+performed|permit\s+logged|permit\s+closed|tcp\s+approved|on-?site\s+pre-?con|phone\s+pre-?con|pre-?con(?:struction)?\s+(?:meeting|held|conducted)|final\s+site\s+check|spoke\s+with|called\b|received\b|emailed\b)/i.test(
-            cleanFallback
-          );
-        if (!alreadyHasLeadIn) {
-          cleanFallback = `Site visit performed. ${cleanFallback}`;
         }
       }
 
@@ -459,7 +424,7 @@ Permit Context:
 Parse this spoken field observation into structured MCDOT inspection fields and a clean chronological narrative sentence (without date or "MAC," prefix) that concludes with "(${gpsStamp})."`,
           config: {
             systemInstruction:
-              'You are a Senior Field Transportation Recording Specialist for Maricopa County Department of Transportation (MCDOT). Strip filler words, accurately classify Traffic Control (MUTCD), Trench/Work Safety, and Restoration/Plating compliance, preserve any spoken names/phone numbers/depths/MAG details, and never invent unstated facts.',
+              'You are a Senior Field Transportation Recording Specialist for Maricopa County Department of Transportation (MCDOT). Strip only hesitation fillers (um, uh, erm), never strip meaningful words like "like", never invent unstated site visits or compliance determinations, default any unmentioned inspection category to "Not Inspected", recognize resolved/corrected items as Resolved rather than Deficient, and preserve any spoken names/phone numbers/depths/MAG details verbatim.',
             responseMimeType: 'application/json',
             responseSchema: {
               type: Type.OBJECT,
@@ -467,22 +432,22 @@ Parse this spoken field observation into structured MCDOT inspection fields and 
                 workStatus: {
                   type: Type.STRING,
                   description:
-                    'One of: "Active Crew On-Site", "No Work / Pass", "Pre-Con / TCP Check", "Deficiency / Correction Required", or "Final / Restoration Complete".',
+                    'One of: "Active Crew On-Site", "No Work / Pass", "Pre-Con / TCP Check", "Deficiency / Correction Required", "Resolved / Corrected", or "Final / Restoration Complete".',
                 },
                 trafficControl: {
                   type: Type.STRING,
                   description:
-                    'One of: "Compliant", "Needs Adjustment", or "Inactive / No Closure".',
+                    'One of: "Compliant", "Deficient", "Resolved", "Inactive / No Closure", or "Not Inspected" (use "Not Inspected" whenever traffic control is not mentioned or checked).',
                 },
                 workSafety: {
                   type: Type.STRING,
                   description:
-                    'One of: "Compliant", "Correction Issued", or "No Active Excavation".',
+                    'One of: "Compliant", "Deficient", "Resolved", "No Active Excavation", or "Not Inspected" (use "Not Inspected" whenever safety/trenching is not mentioned or checked).',
                 },
                 restorationPlates: {
                   type: Type.STRING,
                   description:
-                    'One of: "Compliant", "Plates Pinned & Ramped", "Pending Backfill / Paving", or "Deficiency".',
+                    'One of: "Compliant", "Plates Pinned & Ramped", "Pending Backfill / Paving", "Deficient", "Resolved", or "Not Inspected" (use "Not Inspected" whenever restoration/plating is not mentioned or checked).',
                 },
                 crewSummary: {
                   type: Type.STRING,
@@ -491,12 +456,12 @@ Parse this spoken field observation into structured MCDOT inspection fields and 
                 deficiencies: {
                   type: Type.ARRAY,
                   items: { type: Type.STRING },
-                  description: 'Specific non-compliance items mentioned, or empty array if compliant.',
+                  description: 'Specific unresolved non-compliance items mentioned, or empty array if none.',
                 },
                 cleanNarrative: {
                   type: Type.STRING,
                   description:
-                    'Clean official MCDOT Permit Notes narrative (no leading date or MAC prefix) ending with the GPS timestamp in parentheses.',
+                    'Clean official MCDOT Permit Notes narrative (no leading date or MAC prefix, never blindly adding "Site visit performed.") ending with the GPS timestamp in parentheses.',
                 },
               },
               required: [
@@ -522,10 +487,10 @@ Parse this spoken field observation into structured MCDOT inspection fields and 
         }
         return res.json({
           success: true,
-          workStatus: parsed.workStatus || 'Active Crew On-Site',
-          trafficControl: parsed.trafficControl || 'Compliant',
-          workSafety: parsed.workSafety || 'Compliant',
-          restorationPlates: parsed.restorationPlates || 'Compliant',
+          workStatus: parsed.workStatus || 'Observation Logged',
+          trafficControl: parsed.trafficControl || 'Not Inspected',
+          workSafety: parsed.workSafety || 'Not Inspected',
+          restorationPlates: parsed.restorationPlates || 'Not Inspected',
           crewSummary: parsed.crewSummary || 'Field inspection recorded via AI voice log.',
           deficiencies: Array.isArray(parsed.deficiencies) ? parsed.deficiencies : [],
           cleanNarrative: narrative,
@@ -540,41 +505,109 @@ Parse this spoken field observation into structured MCDOT inspection fields and 
 
     // Deterministic MCDOT structured fallback when offline or API key unavailable
     const lower = rawTranscript.toLowerCase();
-    const isNoWork = /no\s+work|no\s+crew|nobody\s+on\s+site|empty\s+site|inactive/.test(lower);
-    const hasDeficiency = /missing|violation|unsafe|unpinned|no\s+cones|no\s+barricade|fix|deficien|correction|stop\s+work/.test(lower);
-    const hasPlates = /plate|plating|cold\s*mix|ramped/.test(lower);
+    const checkedLower = Array.isArray(checkedItems)
+      ? checkedItems.map((c: unknown) => String(c).toLowerCase()).join(' | ')
+      : '';
+
+    const isNoSiteVisit = /\bno\s+site\s+visit\b|\bnot\s+visited\b|\bcancelled\b|\brain(?:ed|ing)?\s+out\b/.test(lower);
+    const isNoWork = /\bno\s+work\b|\bno\s+crew\b|\bnobody\s+on\s+site\b|\bempty\s+site\b|\binactive\b/.test(lower);
+
+    // Resolution / abatement phrasing must map to Resolved, not Deficient
+    const hasResolvedPhasing =
+      /\b(fixed|repaired|corrected|resolved|abated)\b/i.test(lower) &&
+      !/\b(not\s+(?:fixed|repaired|corrected|resolved|abated)|needs?\s+(?:to\s+be\s+)?(?:fixed|repaired|corrected|resolved))\b/i.test(
+        lower
+      );
+
+    // Unresolved deficiency phrasing (deliberately excludes bare "fix" so "fixed" is never misclassified)
+    const rawDeficiencyMatch =
+      /\b(missing|violation|unsafe|unpinned|no\s+cones|no\s+barricades?|deficien\w*|correction\s+(?:needed|required|issued)|stop\s+work|needs?\s+(?:fix|fixing|repair|correction|adjustment)|not\s+(?:fixed|repaired|corrected|resolved|compliant))\b/i.test(
+        lower
+      );
+    const hasDeficiency = rawDeficiencyMatch && !hasResolvedPhasing;
+
+    const mentionsTrafficControl =
+      /\b(cone|cones|barricade|barricades|sign|signs|signage|tcp|flagger|flaggers|lane\s+closure|arrow\s+board|traffic\s+control|mutcd|taper)\b/i.test(
+        lower
+      ) || /\b(tcp|traffic\s+control|barricade|mutcd)\b/i.test(checkedLower);
+    const confirmsTrafficControlCompliant =
+      /\b(tcp|traffic\s+control|barricade|cones|signage)\b.*\b(compliant|good|ok|okay|approved|in\s+place|verified|proper|set\s+up)\b/i.test(
+        lower
+      ) || /\b(tcp|traffic\s+control|barricade|mutcd)\b/i.test(checkedLower);
+
+    const mentionsSafety =
+      /\b(safety|shoring|trench\s+box|ppe|vest|hard\s+hat|excavat|dust|rule\s*310|water\s+truck|osha|trench)\b/i.test(
+        lower
+      ) || /\b(safety|dust|rule\s*310|shoring|excavat)\b/i.test(checkedLower);
+    const confirmsSafetyCompliant =
+      /\b(safety|shoring|trench|dust|rule\s*310|ppe)\b.*\b(compliant|good|ok|okay|verified|safe|proper)\b/i.test(
+        lower
+      ) || /\b(safety|dust|rule\s*310|shoring)\b/i.test(checkedLower);
+
+    const mentionsRestorationPlates =
+      /\b(plate|plates|plating|cold\s*mix|ramped|pinned|backfill|slurry|clsm|asphalt|patch|t-patch|saw-?cut|restoration|paving|overlay|compaction)\b/i.test(
+        lower
+      ) || /\b(plate|plating|backfill|clsm|slurry|asphalt|restoration)\b/i.test(checkedLower);
+    const confirmsRestorationCompliant =
+      /\b(plate|plates|plating|backfill|slurry|clsm|asphalt|patch|restoration|paving)\b.*\b(compliant|good|ok|okay|pinned|ramped|complete|completed|verified|clean)\b/i.test(
+        lower
+      ) || /\b(plate|plating|backfill|clsm|slurry|restoration)\b/i.test(checkedLower);
 
     const workStatus = hasDeficiency
       ? 'Deficiency / Correction Required'
-      : isNoWork
+      : hasResolvedPhasing
+      ? 'Resolved / Corrected'
+      : isNoSiteVisit || isNoWork
       ? 'No Work / Pass'
-      : /final|complete|closed/.test(lower)
+      : /\b(final|complete|completed|closed)\b/i.test(lower)
       ? 'Final / Restoration Complete'
       : 'Active Crew On-Site';
 
-    const trafficControl =
-      hasDeficiency && /cone|barricade|sign|tcp|flagger|lane/.test(lower)
-        ? 'Needs Adjustment'
-        : isNoWork
-        ? 'Inactive / No Closure'
-        : 'Compliant';
+    let trafficControl = 'Not Inspected';
+    if (mentionsTrafficControl) {
+      if (hasDeficiency && /\b(cone|barricade|sign|tcp|flagger|lane|traffic|mutcd|taper)\b/i.test(lower)) {
+        trafficControl = 'Deficient';
+      } else if (hasResolvedPhasing && /\b(cone|barricade|sign|tcp|flagger|lane|traffic|mutcd|taper)\b/i.test(lower)) {
+        trafficControl = 'Resolved';
+      } else if (confirmsTrafficControlCompliant) {
+        trafficControl = 'Compliant';
+      }
+    } else if (isNoWork && !isNoSiteVisit) {
+      trafficControl = 'Inactive / No Closure';
+    }
 
-    const workSafety = hasDeficiency
-      ? 'Correction Issued'
-      : isNoWork
-      ? 'No Active Excavation'
-      : 'Compliant';
+    let workSafety = 'Not Inspected';
+    if (mentionsSafety) {
+      if (hasDeficiency && /\b(safety|shoring|trench|ppe|excavat|dust|unsafe|violation|stop\s+work)\b/i.test(lower)) {
+        workSafety = 'Deficient';
+      } else if (hasResolvedPhasing && /\b(safety|shoring|trench|ppe|excavat|dust)\b/i.test(lower)) {
+        workSafety = 'Resolved';
+      } else if (confirmsSafetyCompliant) {
+        workSafety = 'Compliant';
+      }
+    } else if (isNoWork && !isNoSiteVisit) {
+      workSafety = 'No Active Excavation';
+    }
 
-    const restorationPlates = hasPlates
-      ? 'Plates Pinned & Ramped'
-      : hasDeficiency && /patch|asphalt|slurry|saw/.test(lower)
-      ? 'Deficiency'
-      : isNoWork
-      ? 'Compliant'
-      : 'Pending Backfill / Paving';
+    let restorationPlates = 'Not Inspected';
+    if (mentionsRestorationPlates) {
+      if (hasDeficiency && /\b(plate|plating|unpinned|patch|asphalt|slurry|saw|backfill|restoration)\b/i.test(lower)) {
+        restorationPlates = 'Deficient';
+      } else if (hasResolvedPhasing && /\b(plate|plating|patch|asphalt|slurry|saw|backfill|restoration)\b/i.test(lower)) {
+        restorationPlates = 'Resolved';
+      } else if (/\b(plate|plating)\b/i.test(lower) && /\b(pinned|ramped|cold\s*mix)\b/i.test(lower)) {
+        restorationPlates = 'Plates Pinned & Ramped';
+      } else if (confirmsRestorationCompliant) {
+        restorationPlates = 'Compliant';
+      } else {
+        restorationPlates = 'Pending Backfill / Paving';
+      }
+    }
 
+    // Strip only isolated hesitation fillers (um, uh, erm); preserve meaningful words like "like"
     const cleanedSpeech = rawTranscript
-      .replace(/\b(um|uh|like|you know|basically)\b/gi, '')
+      .replace(/(?:^|\s)(?:um+|uh+|erm+)(?=[,\s.!?]|$)/gi, ' ')
+      .replace(/\s+([,.;!?])/g, '$1')
       .replace(/\s{2,}/g, ' ')
       .trim();
 
@@ -583,11 +616,12 @@ Parse this spoken field observation into structured MCDOT inspection fields and 
         ? ` Verified: ${checkedItems.join(', ')}.`
         : '';
 
-    const baseSentence = isNoWork
-      ? 'Site visit performed. No crew observed on site working.'
-      : `Site visit performed. ${cleanedSpeech.charAt(0).toUpperCase()}${cleanedSpeech.slice(1).replace(/[.]+$/, '')}.`;
+    // Never auto-prepend "Site visit performed." — preserve verbatim inspector phrasing
+    const capitalizedSpeech = cleanedSpeech
+      ? `${cleanedSpeech.charAt(0).toUpperCase()}${cleanedSpeech.slice(1).replace(/[.]+$/, '')}.`
+      : '';
 
-    const cleanNarrative = `${baseSentence}${checkedSuffix} (${gpsStamp}).`;
+    const cleanNarrative = `${capitalizedSpeech}${checkedSuffix} (${gpsStamp}).`.trim();
 
     return res.json({
       success: true,
@@ -595,7 +629,11 @@ Parse this spoken field observation into structured MCDOT inspection fields and 
       trafficControl,
       workSafety,
       restorationPlates,
-      crewSummary: isNoWork ? 'No crew or active equipment on site.' : cleanedSpeech.slice(0, 68),
+      crewSummary: isNoSiteVisit
+        ? 'No site visit conducted.'
+        : isNoWork
+        ? 'No crew or active equipment on site.'
+        : cleanedSpeech.slice(0, 68),
       deficiencies: hasDeficiency ? ['Field correction noted during patrol inspection'] : [],
       cleanNarrative,
       fullLogRow: `${formattedDate} MAC, ${cleanNarrative}`,
@@ -710,7 +748,27 @@ app.get('/api/mcdot/rit-permits', async (req, res) => {
       }
     }
 
-    // Transform ArcGIS features to Permit model
+    // Parse ArcGIS date attributes (epoch ms or date string) into YYYY-MM-DD, returning null if absent/invalid
+    function parseArcgisDate(val: unknown): string | null {
+      if (val === null || val === undefined || val === '') return null;
+      const d = typeof val === 'number' ? new Date(val) : new Date(String(val));
+      if (isNaN(d.getTime())) return null;
+      return d.toISOString().split('T')[0];
+    }
+
+    function parseArcgisPreConStatus(val: unknown): boolean | null {
+      if (val === null || val === undefined || val === '') return null;
+      if (typeof val === 'boolean') return val;
+      const s = String(val).trim().toLowerCase();
+      if (!s) return null;
+      if (['true', 'yes', 'y', '1', 'completed', 'complete', 'done', 'held'].includes(s)) return true;
+      if (['false', 'no', 'n', '0', 'pending', 'scheduled', 'not completed', 'none'].includes(s)) return false;
+      return null;
+    }
+
+    const todayStartMs = new Date(new Date().toISOString().split('T')[0] + 'T00:00:00Z').getTime();
+
+    // Transform ArcGIS features to Permit model without fabricating missing GIS values
     const transformedPermits = features
       .filter((f) => f.geometry && (f.geometry.x !== undefined && f.geometry.y !== undefined))
       .map((f, i) => {
@@ -718,13 +776,22 @@ app.get('/api/mcdot/rit-permits', async (req, res) => {
         const geom = f.geometry || {};
         const distanceToOrigin = calculateHaversineMiles(lat, lng, geom.y, geom.x);
 
-        const rawStatus = attrs.PermitStatus || 'Issued';
-        let status = 'Active';
-        if (rawStatus === 'In Review' || rawStatus === 'Submitted') status = 'Pre-Con Scheduled';
-        else if (rawStatus === 'Complete') status = 'Completed';
-        else if (rawStatus === 'Denied') status = 'Denied';
-        else if (rawStatus === 'Expired' || rawStatus === 'Plan Approval Expired') status = 'Expired';
-        else if (rawStatus === 'Withdrawn') status = 'Withdrawn';
+        const rawStatusValue = String(attrs.PermitStatus || attrs.PERMIT_STATUS || attrs.Status || '').trim();
+        const rawStatus = rawStatusValue || 'Unknown';
+        let status = 'Unknown';
+        if (rawStatus === 'Issued' || rawStatus === 'Active' || rawStatus === 'Requires Customer Attention' || rawStatus === 'Stop Work Order') {
+          status = 'Active';
+        } else if (rawStatus === 'In Review' || rawStatus === 'Submitted' || rawStatus === 'Submitted - Online') {
+          status = 'Pre-Con Scheduled';
+        } else if (rawStatus === 'Complete' || rawStatus === 'Completed') {
+          status = 'Completed';
+        } else if (rawStatus === 'Denied') {
+          status = 'Denied';
+        } else if (rawStatus === 'Expired' || rawStatus === 'Plan Approval Expired') {
+          status = 'Expired';
+        } else if (rawStatus === 'Withdrawn') {
+          status = 'Withdrawn';
+        }
 
         const rawScope = (attrs.ScopeOfWork || attrs.Description || attrs.WorkDescription || attrs.PermitType || 'Right-of-Way Utility & Access Work').trim();
         const lowerScope = rawScope.toLowerCase();
@@ -739,7 +806,7 @@ app.get('/api/mcdot/rit-permits', async (req, res) => {
         const tc = String(attrs.PermitID || attrs.PermitNumber || attrs.PERMIT_NO || `TC2026${String(attrs.OBJECTID || i).padStart(4, '0')}`).trim();
         const permitGuid = attrs.GlobalID || attrs.GlobalId || attrs.PermitGuid || attrs.PermitGUID || attrs.GUID || attrs.EnergovId || attrs.PERMIT_GUID || undefined;
 
-        // Pull actual Contractor / Permittee / Applicant company name from ArcGIS attributes when available
+        // Pull authentic GIS contractor / contact / phone columns; return null if not listed in GIS
         const rawAttrCompany = (
           attrs.ContractorName ||
           attrs.Contractor ||
@@ -785,60 +852,40 @@ app.get('/api/mcdot/rit-permits', async (req, res) => {
           .toString()
           .trim();
 
-        // Deterministic Maricopa County ROW Permittee & Field Superintendent directory fallback
-        // when ArcGIS public geometry layer omits private applicant contact columns
-        const FALLBACK_ROSTER = [
-          { company: 'Southwest Earthworks & Paving LLC', contact: 'Cody Miller (Supt.)', phone: '(623) 826-4310' },
-          { company: 'Courtland Homes Civil Group', contact: 'Rick Navarro (Supt.)', phone: '(480) 694-5434' },
-          { company: 'Copper State Civil Construction', contact: 'Ray Carlson (Field PM)', phone: '(602) 481-7290' },
-          { company: 'Sunland Asphalt & Construction', contact: 'Abe Garcia (Foreman)', phone: '(623) 826-4367' },
-          { company: 'Hunter Contracting Co.', contact: 'Markus Henderson (Supt.)', phone: '(480) 895-8800' },
-          { company: 'Achen-Gardner Construction', contact: 'Wyatt Keller (Supt.)', phone: '(480) 403-9400' },
-        ];
-        const hashSeed = tc.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
-        const fallbackEntry = FALLBACK_ROSTER[hashSeed % FALLBACK_ROSTER.length];
+        const contractor: string | null =
+          rawAttrCompany && !/^(permittee|general contractor|other item|unknown|n\/a|none)$/i.test(rawAttrCompany)
+            ? rawAttrCompany
+            : null;
+        const contractorContact: string | null = rawAttrContact || null;
+        const contractorPhone: string | null = rawAttrPhone || null;
 
-        let contractor = rawAttrCompany;
-        let contractorContact = rawAttrContact;
-        let contractorPhone = rawAttrPhone;
+        // Pull authentic GIS dates, work hours, and pre-con status; never synthesize fake fallbacks
+        const issueDate = parseArcgisDate(
+          attrs.ISSUE_DATE ?? attrs.IssueDate ?? attrs.IssuedDate ?? attrs.DateIssued
+        );
+        const expirationDate = parseArcgisDate(
+          attrs.EXPIRATION_DATE ?? attrs.ExpirationDate ?? attrs.ExpDate ?? attrs.ExpireDate
+        );
+        const rawWorkHours = (
+          attrs.WORK_HOURS ||
+          attrs.WorkHours ||
+          attrs.WorkWindow ||
+          attrs.WORK_WINDOW ||
+          ''
+        )
+          .toString()
+          .trim();
+        const workWindow: string | null = rawWorkHours || null;
+        const preConCompleted = parseArcgisPreConStatus(
+          attrs.PRECON_STATUS ?? attrs.PreConStatus ?? attrs.PreConCompleted ?? attrs.PRECON_COMPLETED
+        );
 
-        if (!contractor || /permittee|general contractor|other item|unknown/i.test(contractor)) {
-          if (lowerScope.includes('cox')) {
-            contractor = 'Cox Communications / CSW Contractors';
-            contractorContact = contractorContact || 'Anthony DeMarco (Field Lead)';
-            contractorPhone = contractorPhone || '(602) 242-7000';
-          } else if (lowerScope.includes('srp') || lowerScope.includes('salt river')) {
-            contractor = 'Salt River Project (SRP) / Michels Power';
-            contractorContact = contractorContact || 'Derek Vance (Supt.)';
-            contractorPhone = contractorPhone || '(602) 236-8888';
-          } else if (lowerScope.includes('aps') || lowerScope.includes('arizona public')) {
-            contractor = 'Arizona Public Service (APS) / Henkels & McCoy';
-            contractorContact = contractorContact || 'Travis Miller (Field Coord.)';
-            contractorPhone = contractorPhone || '(602) 250-1000';
-          } else if (lowerScope.includes('swg') || lowerScope.includes('southwest gas') || lowerScope.includes('gas')) {
-            contractor = 'Southwest Gas / NPL Construction';
-            contractorContact = contractorContact || 'Carlos Ramirez (Foreman)';
-            contractorPhone = contractorPhone || '(602) 276-8800';
-          } else if (lowerScope.includes('lumen') || lowerScope.includes('centurylink') || lowerScope.includes('qwest')) {
-            contractor = 'Lumen Technologies / B&F Contracting';
-            contractorContact = contractorContact || 'Elena Rostova (Site PM)';
-            contractorPhone = contractorPhone || '(480) 968-9800';
-          } else if (lowerScope.includes('epcor') || lowerScope.includes('water')) {
-            contractor = 'EPCOR Water / Haydon Building Corp';
-            contractorContact = contractorContact || 'Ray Sanchez (Site PM)';
-            contractorPhone = contractorPhone || '(602) 296-5600';
-          } else if (lowerScope.includes('at&t') || lowerScope.includes('att') || lowerScope.includes('verizon') || lowerScope.includes('fiber')) {
-            contractor = 'Team Fishel / Utility Fiber Services';
-            contractorContact = contractorContact || 'Gabe Morales (Supt.)';
-            contractorPhone = contractorPhone || '(623) 582-4190';
-          } else {
-            contractor = fallbackEntry.company;
-            contractorContact = contractorContact || fallbackEntry.contact;
-            contractorPhone = contractorPhone || fallbackEntry.phone;
+        // Enforce expiration check against current date when expirationDate is present in GIS
+        if (expirationDate) {
+          const expMs = new Date(`${expirationDate}T00:00:00Z`).getTime();
+          if (!isNaN(expMs) && expMs < todayStartMs && status !== 'Completed' && status !== 'Denied' && status !== 'Withdrawn') {
+            status = 'Expired';
           }
-        } else {
-          contractorContact = contractorContact || fallbackEntry.contact;
-          contractorPhone = contractorPhone || fallbackEntry.phone;
         }
 
         // Primary Street & Cross-Street extraction from ArcGIS attributes
@@ -876,10 +923,7 @@ app.get('/api/mcdot/rit-permits', async (req, res) => {
         } else if (crossStreet) {
           locationStr = crossStreet;
         } else {
-          // Estimate local Maricopa grid road / corridor from coordinates when street attribute is blank in GIS
-          const nsAve = Math.round(Math.abs(-112.074 - geom.x) * 69 * 8);
-          const ewSegment = geom.y >= 33.745 ? 'W Dixileta Dr / W Baker Dr' : geom.y >= 33.72 ? 'W Patton Rd Corridor' : 'Maricopa County Arterial';
-          locationStr = nsAve > 10 && nsAve < 350 ? `${ewSegment} & N ${nsAve}th Ave` : ewSegment;
+          locationStr = `Lat: ${Number(geom.y).toFixed(4)}, Lng: ${Number(geom.x).toFixed(4)}`;
         }
 
         return {
@@ -898,18 +942,18 @@ app.get('/api/mcdot/rit-permits', async (req, res) => {
           distanceMiles: distanceToOrigin,
           permitType: pType,
           status,
-          rawRitStatus: rawStatus,
-          ritColor: mapRitColor(rawStatus),
-          issueDate: new Date().toISOString().split('T')[0],
-          expirationDate: '2026-12-31',
-          workWindow: '08:30 - 15:30 Mon-Fri',
-          preConCompleted: status === 'Active' || status === 'Final Inspection Pending',
+          rawRitStatus: status === 'Expired' && rawStatus === 'Unknown' ? 'Expired' : rawStatus,
+          ritColor: mapRitColor(status === 'Expired' ? 'Expired' : rawStatus),
+          issueDate,
+          expirationDate,
+          workWindow,
+          preConCompleted,
           hasSignInSheet: false,
           hasBusinessCards: false,
           trafficControlPlan: 'MCDOT Uniform Standard Traffic Control Plan',
           specialConditions: [
             `Live MCDOT RIT Feed (Layer 15: Right-Of-Way Permit)`,
-            `Status: ${rawStatus}`,
+            `Status: ${status === 'Expired' ? 'Expired' : rawStatus}`,
             `Scope: ${rawScope}`,
             'Conforms to MAG Uniform Standard Specifications & Maricopa County Rule 310.',
           ],

@@ -973,13 +973,77 @@ export function calculateDistanceMiles(
 }
 
 /**
- * Returns the 10 closest right-of-way permits to a given GPS coordinate
+ * Checks whether a permit's expirationDate is strictly in the past relative to today's date.
  */
-export function getTenClosestPermits(
+export function isPermitExpired(
+  expirationDate?: string | null,
+  referenceDate: Date = new Date()
+): boolean {
+  if (!expirationDate) return false;
+  const trimmed = String(expirationDate).trim();
+  if (!trimmed) return false;
+
+  const isoMatch = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  let expTime: number;
+  if (isoMatch) {
+    expTime = new Date(
+      Number(isoMatch[1]),
+      Number(isoMatch[2]) - 1,
+      Number(isoMatch[3]),
+      23,
+      59,
+      59,
+      999
+    ).getTime();
+  } else {
+    expTime = new Date(trimmed).getTime();
+  }
+
+  if (isNaN(expTime)) return false;
+  const todayStart = new Date(
+    referenceDate.getFullYear(),
+    referenceDate.getMonth(),
+    referenceDate.getDate(),
+    0,
+    0,
+    0,
+    0
+  ).getTime();
+
+  return expTime < todayStart;
+}
+
+/**
+ * Flags permits past their expirationDate as 'Expired' during ingestion
+ * (without overwriting Completed, Denied, or Withdrawn statuses).
+ */
+export function normalizePermitExpirationStatus(
+  permit: Permit,
+  referenceDate: Date = new Date()
+): Permit {
+  if (
+    permit.status !== 'Completed' &&
+    permit.status !== 'Denied' &&
+    permit.status !== 'Withdrawn' &&
+    isPermitExpired(permit.expirationDate, referenceDate)
+  ) {
+    return {
+      ...permit,
+      status: 'Expired',
+      rawRitStatus: 'Expired',
+    };
+  }
+  return permit;
+}
+
+/**
+ * Returns up to 10 of the nearest right-of-way permits to a given GPS coordinate (default `limit = 10`).
+ */
+export function getNearestPermits(
   currentLat: number,
   currentLng: number,
   permits: Permit[] = INITIAL_MARICOPA_PERMITS,
-  limit = 16
+  limit = 10
 ): Permit[] {
   const permitsWithDistance = permits.map((permit) => ({
     ...permit,
@@ -998,23 +1062,34 @@ export function getTenClosestPermits(
 /**
  * Evaluates whether a permit is an actionable active permit.
  * Strictly filters to 'Issued', 'Requires Customer Attention', 'Stop Work', or 'In Review'
- * and excludes Denied, Complete, Expired, and Withdrawn permits.
+ * and excludes Denied, Complete, Expired (by status OR past expirationDate), Withdrawn, and Unknown permits.
  */
-export function isActionableActivePermit(permit: { rawRitStatus?: string; status?: string }): boolean {
+export function isActionableActivePermit(permit: {
+  rawRitStatus?: string;
+  status?: string;
+  expirationDate?: string | null;
+}): boolean {
   const raw = (permit.rawRitStatus || '').trim().toLowerCase();
   const status = (permit.status || '').trim().toLowerCase();
 
-  // Explicitly reject non-actionable or inactive/completed permits
+  // Explicitly reject expired-by-date permits even if status string wasn't updated
+  if (isPermitExpired(permit.expirationDate)) {
+    return false;
+  }
+
+  // Explicitly reject non-actionable, inactive, unknown, or completed permits
   if (
     raw.includes('denied') ||
     raw.includes('complete') ||
     raw.includes('expired') ||
     raw.includes('withdrawn') ||
+    raw === 'unknown' ||
     status.includes('denied') ||
     status.includes('complete') ||
     status.includes('completed') ||
     status.includes('expired') ||
-    status.includes('withdrawn')
+    status.includes('withdrawn') ||
+    status === 'unknown'
   ) {
     return false;
   }
@@ -1110,45 +1185,12 @@ export interface ResolvedPermitCardContact {
 }
 
 const GENERIC_CONTRACTOR_PATTERNS =
-  /^(?:permittee\s*\/?\s*general\s*contractor|general\s*contractor|commercial\s*\/?\s*residential\s*developer|electrical\s*utility\s*contractor|maricopa\s*county\s*row|unknown|other\s*item)$/i;
+  /^(?:permittee\s*\/?\s*general\s*contractor|general\s*contractor|commercial\s*\/?\s*residential\s*developer|electrical\s*utility\s*contractor|maricopa\s*county\s*row|unknown|other\s*item|not\s+listed(\s+in\s+gis)?)$/i;
 
 const GENERIC_CONTACT_PATTERNS =
-  /^(?:field\s*superintendent|site\s*contact|contractor\s*rep|permittee|unknown)$/i;
+  /^(?:field\s*superintendent|site\s*contact|contractor\s*rep|permittee|unknown|not\s+listed(\s+in\s+gis)?)$/i;
 
-const FALLBACK_COMPANY_DIRECTORY = [
-  {
-    company: 'Southwest Earthworks & Paving LLC',
-    contact: 'Cody Miller (Supt.)',
-    phone: '(623) 826-4310',
-  },
-  {
-    company: 'Courtland Homes Civil Group',
-    contact: 'Rick Navarro (Supt.)',
-    phone: '(480) 694-5434',
-  },
-  {
-    company: 'Copper State Civil Construction',
-    contact: 'Ray Carlson (Field PM)',
-    phone: '(602) 481-7290',
-  },
-  {
-    company: 'Sunland Asphalt & Construction',
-    contact: 'Abe Garcia (Foreman)',
-    phone: '(623) 826-4367',
-  },
-  {
-    company: 'Hunter Contracting Co.',
-    contact: 'Markus Henderson (Supt.)',
-    phone: '(480) 895-8800',
-  },
-  {
-    company: 'Achen-Gardner Construction',
-    contact: 'Wyatt Keller (Supt.)',
-    phone: '(480) 403-9400',
-  },
-];
-
-function cleanPhoneDigits(rawPhone?: string): { display: string; clean: string } {
+function cleanPhoneDigits(rawPhone?: string | null): { display: string; clean: string } {
   const digits = (rawPhone || '').replace(/\D/g, '');
   const ten = digits.length === 11 && digits.startsWith('1') ? digits.slice(1) : digits;
   if (ten.length === 10) {
@@ -1161,55 +1203,29 @@ function cleanPhoneDigits(rawPhone?: string): { display: string; clean: string }
 }
 
 /**
- * Resolves the actual Contractor / Permittee Company Name, Field Superintendent / Pre-Con Contact Name,
- * and 1-tap Click-to-Call phone number for any permit card — eliminating generic placeholders like
- * "Permittee / General Contractor" or "Field Superintendent" even on legacy cached permits.
+ * Resolves the authentic Contractor / Permittee Company Name, Field Superintendent / Pre-Con Contact Name,
+ * and phone number from inspector notes, saved Pre-Con contact, or authentic GIS attributes.
+ * Never fabricates contractors, contacts, or phone numbers when missing from GIS.
  */
 export function resolvePermitCardContact(
   permit: Permit,
   extractedNotesContacts: ExtractedPermitContact[] = [],
   preConContact?: PreConContact | null
 ): ResolvedPermitCardContact {
-  const cleanTc = (permit.tcNumber || '').trim();
-  const knownInitial = INITIAL_MARICOPA_PERMITS.find(
-    (p) => p.tcNumber.trim().toLowerCase() === cleanTc.toLowerCase()
-  );
+  // Resolve authentic company name (never synthesize when missing from GIS)
+  const rawCompany = (permit.contractor || '').trim();
+  const baseCompany =
+    rawCompany && !GENERIC_CONTRACTOR_PATTERNS.test(rawCompany)
+      ? rawCompany
+      : 'Not Listed in GIS';
 
-  const seed = cleanTc.split('').reduce((acc, ch) => acc + ch.charCodeAt(0), 0);
-  const rosterFallback = FALLBACK_COMPANY_DIRECTORY[seed % FALLBACK_COMPANY_DIRECTORY.length];
+  // Resolve authentic contact name if present
+  const rawContact = (permit.contractorContact || '').trim();
+  const baseContact =
+    rawContact && !GENERIC_CONTACT_PATTERNS.test(rawContact) ? rawContact : '';
 
-  // Resolve real company name (never generic placeholder)
-  let baseCompany = (permit.contractor || '').trim();
-  if (!baseCompany || GENERIC_CONTRACTOR_PATTERNS.test(baseCompany)) {
-    const scopeLower = `${permit.projectTitle || ''} ${permit.location || ''}`.toLowerCase();
-    if (knownInitial?.contractor) {
-      baseCompany = knownInitial.contractor;
-    } else if (scopeLower.includes('cox')) {
-      baseCompany = 'Cox Communications / CSW Contractors';
-    } else if (scopeLower.includes('srp') || scopeLower.includes('salt river')) {
-      baseCompany = 'Salt River Project (SRP) / Michels Power';
-    } else if (scopeLower.includes('aps')) {
-      baseCompany = 'Arizona Public Service (APS) / Henkels & McCoy';
-    } else if (scopeLower.includes('swg') || scopeLower.includes('gas')) {
-      baseCompany = 'Southwest Gas / NPL Construction';
-    } else if (scopeLower.includes('lumen') || scopeLower.includes('centurylink')) {
-      baseCompany = 'Lumen Technologies / B&F Contracting';
-    } else {
-      baseCompany = rosterFallback.company;
-    }
-  }
-
-  // Resolve base superintendent / field contact name
-  let baseContact = (permit.contractorContact || '').trim();
-  if (!baseContact || GENERIC_CONTACT_PATTERNS.test(baseContact)) {
-    baseContact = knownInitial?.contractorContact || rosterFallback.contact;
-  }
-
-  // Resolve base phone (replace generic county switchboard 602-506-8600 with direct field superintendent cell)
-  let rawPermitPhone = (permit.contractorPhone || '').trim();
-  if (!rawPermitPhone || rawPermitPhone.replace(/\D/g, '') === '6025068600') {
-    rawPermitPhone = knownInitial?.contractorPhone || rosterFallback.phone;
-  }
+  // Resolve authentic phone if present
+  const rawPermitPhone = (permit.contractorPhone || '').trim();
   const basePhoneParsed = cleanPhoneDigits(rawPermitPhone);
 
   // 1. Highest priority: Contact auto-extracted from Permit Notes narrative
@@ -1240,22 +1256,19 @@ export function resolvePermitCardContact(
       companyName:
         pc.company && !GENERIC_CONTRACTOR_PATTERNS.test(pc.company) ? pc.company : baseCompany,
       contactName:
-        pc.name && !GENERIC_CONTACT_PATTERNS.test(pc.name)
-          ? pc.name
-          : baseContact,
-      displayPhone: pcPhone.display || basePhoneParsed.display || rosterFallback.phone,
-      cleanPhone:
-        pcPhone.clean || basePhoneParsed.clean || rosterFallback.phone.replace(/\D/g, ''),
+        pc.name && !GENERIC_CONTACT_PATTERNS.test(pc.name) ? pc.name : baseContact,
+      displayPhone: pcPhone.display || basePhoneParsed.display,
+      cleanPhone: pcPhone.clean || basePhoneParsed.clean,
       source: 'precon',
     };
   }
 
-  // 3. Permit record / directory contact
+  // 3. Permit record contact (truthful GIS data only; no fabricated fallbacks)
   return {
     companyName: baseCompany,
     contactName: baseContact,
-    displayPhone: basePhoneParsed.display || rosterFallback.phone,
-    cleanPhone: basePhoneParsed.clean || rosterFallback.phone.replace(/\D/g, ''),
+    displayPhone: basePhoneParsed.display,
+    cleanPhone: basePhoneParsed.clean,
     source: 'permit',
   };
 }
@@ -1362,13 +1375,26 @@ export function getClarifiedPermitStatusInfo(
 ): ClarifiedPermitStatusInfo {
   const rawRit = (permit.rawRitStatus || '').trim();
   const status = (permit.status || '').trim();
+  const expiredByDate = isPermitExpired(permit.expirationDate);
 
-  let ritBadgeLabel = 'Issued';
+  let ritBadgeLabel = 'Unknown';
   let ritBadgeClass =
-    'bg-blue-50 text-blue-900 border-blue-300 dark:bg-blue-950/90 dark:text-blue-200 dark:border-blue-500/60';
-  let ritTooltip = 'MCDOT RIT Permit Status: Issued & active for field inspection';
+    'bg-slate-100 text-slate-700 border-slate-300 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-600';
+  let ritTooltip = 'MCDOT RIT Permit Status: Not listed in GIS';
 
-  if (/attention/i.test(rawRit)) {
+  if (
+    (/expired/i.test(rawRit) || status === 'Expired' || expiredByDate) &&
+    status !== 'Completed' &&
+    status !== 'Denied' &&
+    status !== 'Withdrawn'
+  ) {
+    ritBadgeLabel = 'Expired';
+    ritBadgeClass =
+      'bg-orange-100 text-orange-950 border-orange-400 dark:bg-orange-950/90 dark:text-orange-200 dark:border-orange-500/60';
+    ritTooltip = permit.expirationDate
+      ? `MCDOT Permit Expired on ${permit.expirationDate}`
+      : 'MCDOT RIT Permit Status: Expired';
+  } else if (/attention/i.test(rawRit)) {
     ritBadgeLabel = 'Cust. Attention';
     ritBadgeClass =
       'bg-amber-100 text-amber-950 border-amber-400 dark:bg-amber-950/90 dark:text-amber-200 dark:border-amber-400/70';
@@ -1393,11 +1419,21 @@ export function getClarifiedPermitStatusInfo(
     ritBadgeClass =
       'bg-slate-100 text-slate-800 border-slate-300 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-600';
     ritTooltip = 'MCDOT RIT Permit Status: Completed';
-  } else if (/expired/i.test(rawRit) || status === 'Expired') {
-    ritBadgeLabel = 'Expired';
+  } else if (/denied/i.test(rawRit) || status === 'Denied') {
+    ritBadgeLabel = 'Denied';
     ritBadgeClass =
-      'bg-orange-100 text-orange-950 border-orange-400 dark:bg-orange-950/90 dark:text-orange-200 dark:border-orange-500/60';
-    ritTooltip = 'MCDOT RIT Permit Status: Expired';
+      'bg-rose-100 text-rose-950 border-rose-400 dark:bg-rose-950/90 dark:text-rose-200 dark:border-rose-500/60';
+    ritTooltip = 'MCDOT RIT Permit Status: Denied';
+  } else if (/withdrawn/i.test(rawRit) || status === 'Withdrawn') {
+    ritBadgeLabel = 'Withdrawn';
+    ritBadgeClass =
+      'bg-slate-100 text-slate-700 border-slate-300 dark:bg-slate-800 dark:text-slate-300 dark:border-slate-600';
+    ritTooltip = 'MCDOT RIT Permit Status: Withdrawn';
+  } else if (/issued/i.test(rawRit) || status === 'Active') {
+    ritBadgeLabel = 'Issued';
+    ritBadgeClass =
+      'bg-blue-50 text-blue-900 border-blue-300 dark:bg-blue-950/90 dark:text-blue-200 dark:border-blue-500/60';
+    ritTooltip = 'MCDOT RIT Permit Status: Issued & active for field inspection';
   }
 
   // Clarify field inspection lifecycle badge meaning

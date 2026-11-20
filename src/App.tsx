@@ -3,7 +3,8 @@ import { APIProvider } from '@vis.gl/react-google-maps';
 import { Permit, GPSPosition, PermitNoteFile } from './types/permit';
 import {
   INITIAL_MARICOPA_PERMITS,
-  getTenClosestPermits,
+  getNearestPermits,
+  normalizePermitExpirationStatus,
   isActionableActivePermit,
   calculateDistanceMiles,
   calculateBearingDegrees,
@@ -81,6 +82,12 @@ import { useOnlineStatus } from './hooks/useOnlineStatus';
 import {
   cachePermitsLocally,
   getCachedPermitsLocally,
+  STORAGE_ERROR_EVENT,
+  SYNC_QUEUE_UPDATED_EVENT,
+  enqueueOfflineSync,
+  getOfflineSyncQueue,
+  getOfflineSyncQueueAsync,
+  clearOfflineSyncByTcNumber,
 } from './services/offlineStorage';
 import {
   getInspectorSession,
@@ -160,10 +167,11 @@ export default function App() {
   const [accessToken, setAccessToken] = useState<string | null>(null);
   const [isSigningIn, setIsSigningIn] = useState(false);
 
-  // Permits state - starts with local cached or initial permits
+  // Permits state - starts with local cached or initial permits (with expiration status enforced)
   const [allPermits, setAllPermits] = useState<Permit[]>(() => {
     const cached = getCachedPermitsLocally();
-    return cached.length > 0 ? cached : INITIAL_MARICOPA_PERMITS;
+    const source = cached.length > 0 ? cached : INITIAL_MARICOPA_PERMITS;
+    return source.map((p) => normalizePermitExpirationStatus(p));
   });
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter] = useState<string>('ALL');
@@ -262,8 +270,35 @@ export default function App() {
   const [selectedBatchPermitIds, setSelectedBatchPermitIds] = useState<Set<string>>(new Set());
   const [batchNoteInput, setBatchNoteInput] = useState('');
 
-  // 'Visited Today' Tracker & Re-render trigger
+  // 'Visited Today' Tracker, Storage Quota Alert & Offline Sync Queue Re-render triggers
   const [visitedTick, setVisitedTick] = useState(0);
+  const [storageErrorMsg, setStorageErrorMsg] = useState<string | null>(null);
+  const [offlineQueueTick, setOfflineQueueTick] = useState(0);
+  const [queuedSyncTcs, setQueuedSyncTcs] = useState<Set<string>>(
+    () => new Set(getOfflineSyncQueue().map((item) => item.tcNumber.trim()))
+  );
+
+  // Listen for real localStorage / IndexedDB write failures and offline sync queue updates
+  useEffect(() => {
+    const handleStorageError = (evt: Event) => {
+      const detail = (evt as CustomEvent<{ message?: string }>).detail;
+      setStorageErrorMsg(detail?.message || 'Storage full — export or sync logs now');
+    };
+    const refreshQueue = () => {
+      setOfflineQueueTick((t) => t + 1);
+      void getOfflineSyncQueueAsync().then((items) => {
+        setQueuedSyncTcs(new Set(items.map((item) => item.tcNumber.trim())));
+      });
+    };
+
+    window.addEventListener(STORAGE_ERROR_EVENT, handleStorageError);
+    window.addEventListener(SYNC_QUEUE_UPDATED_EVENT, refreshQueue);
+    refreshQueue();
+    return () => {
+      window.removeEventListener(STORAGE_ERROR_EVENT, handleStorageError);
+      window.removeEventListener(SYNC_QUEUE_UPDATED_EVENT, refreshQueue);
+    };
+  }, []);
 
   // Scan all locally stored PermitNoteFile records for Sync All Notes & Drive folder status
   const localPermitNoteFiles = useMemo(() => {
@@ -286,7 +321,7 @@ export default function App() {
       // Ignore localStorage read errors
     }
     return results.sort((a, b) => a.tcNumber.localeCompare(b.tcNumber));
-  }, [visitedTick, showSignInModal, accessToken]);
+  }, [visitedTick, offlineQueueTick, showSignInModal, accessToken]);
 
   const [expandedVisitedIds, setExpandedVisitedIds] = useState<Set<string>>(new Set());
   const [collapseLoggedToday] = useState<boolean>(true);
@@ -295,9 +330,13 @@ export default function App() {
   const unsyncedNoteFiles = useMemo(
     () =>
       localPermitNoteFiles.filter(
-        (nf) => nf.hasUnsyncedChanges || !nf.lastSyncedAt || !nf.driveFileId
+        (nf) =>
+          nf.hasUnsyncedChanges ||
+          !nf.lastSyncedAt ||
+          !nf.driveFileId ||
+          queuedSyncTcs.has(nf.tcNumber.trim())
       ),
-    [localPermitNoteFiles]
+    [localPermitNoteFiles, queuedSyncTcs]
   );
 
   const unsyncedNoteCount = unsyncedNoteFiles.length;
@@ -389,37 +428,46 @@ export default function App() {
         ],
       };
 
-      saveLocalPermitNote(updatedFile);
+      const saveResult = saveLocalPermitNote(updatedFile);
+      if (!saveResult.ok) {
+        setQuickLoggingTc(null);
+        setStorageErrorMsg(saveResult.error || 'Storage full — export or sync logs now');
+        showToast(saveResult.error || 'Storage full — could not save on-site check', 'warning');
+        return;
+      }
       setVisitedTick((t) => t + 1);
 
       const hasValidToken = Boolean(accessToken && hasValidCachedDriveToken(accessToken));
-      if (hasValidToken && accessToken) {
+      if (hasValidToken && accessToken && isOnline) {
         try {
           const refreshed = (await verifyAndRefreshDriveToken(accessToken)) || accessToken;
           if (refreshed !== accessToken) setAccessToken(refreshed);
           await syncPermitNoteStateToDrive(refreshed, permit, updatedFile);
+          await clearOfflineSyncByTcNumber(cleanTc);
           setVisitedTick((t) => t + 1);
           showToast(
             `Logged ${verifiedItems.length || 'Pass'} on-site check & synced to Google Drive (${cleanTc})`,
             'success'
           );
-        } catch {
+        } catch (err: any) {
+          await enqueueOfflineSync(cleanTc, 'NOTE', { tcNumber: cleanTc }, err?.message);
           showToast(
-            `On-site check saved locally (${cleanTc}) — queued in Google Drive badge`,
+            `On-site check saved locally (${cleanTc}) — queued for retry in Drive Sync`,
             'warning'
           );
         } finally {
           setQuickLoggingTc(null);
         }
       } else {
+        await enqueueOfflineSync(cleanTc, 'NOTE', { tcNumber: cleanTc }, 'Offline or Drive not connected');
         setQuickLoggingTc(null);
         showToast(
-          `On-site check logged (${cleanTc}) — queued in Google Drive sync badge`,
+          `On-site check logged (${cleanTc}) — queued in Drive Sync`,
           'success'
         );
       }
     },
-    [accessToken, complianceChecksByTc, currentGps.lat, currentGps.lng, showToast]
+    [accessToken, complianceChecksByTc, currentGps.lat, currentGps.lng, isOnline, showToast]
   );
 
   // Save Gemini-Parsed Hold-to-Speak AI Field Log & Queue/Sync to Google Drive
@@ -454,31 +502,39 @@ export default function App() {
         ],
       };
 
-      saveLocalPermitNote(updatedFile);
+      const saveResult = saveLocalPermitNote(updatedFile);
+      if (!saveResult.ok) {
+        setStorageErrorMsg(saveResult.error || 'Storage full — export or sync logs now');
+        showToast(saveResult.error || 'Storage full — could not save voice log', 'warning');
+        return;
+      }
       setVisitedTick((t) => t + 1);
 
       const hasValidToken = Boolean(accessToken && hasValidCachedDriveToken(accessToken));
-      if (hasValidToken && accessToken) {
+      if (hasValidToken && accessToken && isOnline) {
         try {
           const refreshed = (await verifyAndRefreshDriveToken(accessToken)) || accessToken;
           if (refreshed !== accessToken) setAccessToken(refreshed);
           await syncPermitNoteStateToDrive(refreshed, permit, updatedFile);
+          await clearOfflineSyncByTcNumber(cleanTc);
           setVisitedTick((t) => t + 1);
           showToast(`AI Voice Log structured & synced to Google Drive (${cleanTc})`, 'success');
-        } catch {
+        } catch (err: any) {
+          await enqueueOfflineSync(cleanTc, 'NOTE', { tcNumber: cleanTc }, err?.message);
           showToast(
-            `AI Voice Log structured & queued for Google Drive sync (${cleanTc})`,
+            `AI Voice Log saved locally & queued for Drive retry (${cleanTc})`,
             'warning'
           );
         }
       } else {
+        await enqueueOfflineSync(cleanTc, 'NOTE', { tcNumber: cleanTc }, 'Offline or Drive not connected');
         showToast(
-          `AI Voice Log structured & queued in Google Drive badge (${cleanTc})`,
+          `AI Voice Log saved locally & queued in Drive Sync (${cleanTc})`,
           'success'
         );
       }
     },
-    [accessToken, showToast]
+    [accessToken, isOnline, showToast]
   );
 
   // Batch Apply Notes Handler
@@ -495,6 +551,8 @@ export default function App() {
       setAccessToken(activeToken);
     }
 
+    let savedCount = 0;
+    let storageFailed = false;
     for (const permitId of selectedBatchPermitIds) {
       const permit = allPermits.find((p) => p.id === permitId);
       if (!permit) continue;
@@ -511,12 +569,23 @@ export default function App() {
       const updatedFile = {
         ...file,
         inspectorNotes: [...file.inspectorNotes, newUpdate],
-        hasUnsyncedChanges: !activeToken,
+        hasUnsyncedChanges: true,
       };
-      saveLocalPermitNote(updatedFile);
+      const saveResult = saveLocalPermitNote(updatedFile);
+      if (!saveResult.ok) {
+        storageFailed = true;
+        setStorageErrorMsg(saveResult.error || 'Storage full — export or sync logs now');
+        break;
+      }
+      savedCount++;
 
-      if (activeToken) {
-        syncPermitNoteStateToDrive(activeToken, permit, updatedFile).catch(() => {});
+      const cleanTc = permit.tcNumber.trim();
+      if (activeToken && isOnline) {
+        syncPermitNoteStateToDrive(activeToken, permit, updatedFile)
+          .then(() => clearOfflineSyncByTcNumber(cleanTc))
+          .catch((err) => enqueueOfflineSync(cleanTc, 'NOTE', { tcNumber: cleanTc }, err?.message));
+      } else {
+        void enqueueOfflineSync(cleanTc, 'NOTE', { tcNumber: cleanTc }, 'Offline or Drive not connected');
       }
     }
 
@@ -524,12 +593,19 @@ export default function App() {
     setIsBatchMode(false);
     setSelectedBatchPermitIds(new Set());
     setVisitedTick((t) => t + 1);
-    showToast(
-      activeToken
-        ? `Logged & syncing notes across ${count} permits to Google Drive!`
-        : `Saved notes locally across ${count} permits — Connect Google Drive to sync .DOCX`,
-      activeToken ? 'success' : 'warning'
-    );
+    if (storageFailed) {
+      showToast(
+        `Storage full after saving ${savedCount}/${count} permits — export or sync logs now`,
+        'warning'
+      );
+    } else {
+      showToast(
+        activeToken && isOnline
+          ? `Logged & syncing notes across ${savedCount} permits to Google Drive!`
+          : `Saved notes locally across ${savedCount} permits — queued in Drive Sync`,
+        activeToken && isOnline ? 'success' : 'warning'
+      );
+    }
   };
 
   // Swipe-Right / 1-Tap "No Work / Pass (GPS Logged)" Quick-Log Action
@@ -570,36 +646,45 @@ export default function App() {
         ],
       };
 
-      saveLocalPermitNote(updatedFile);
+      const saveResult = saveLocalPermitNote(updatedFile);
+      if (!saveResult.ok) {
+        setQuickLoggingTc(null);
+        setStorageErrorMsg(saveResult.error || 'Storage full — export or sync logs now');
+        showToast(saveResult.error || 'Storage full — could not save drive-by log', 'warning');
+        return;
+      }
       setVisitedTick((t) => t + 1);
 
       const hasValidToken = Boolean(accessToken && hasValidCachedDriveToken(accessToken));
-      if (hasValidToken && accessToken) {
+      if (hasValidToken && accessToken && isOnline) {
         try {
           const refreshed = (await verifyAndRefreshDriveToken(accessToken)) || accessToken;
           if (refreshed !== accessToken) {
             setAccessToken(refreshed);
           }
           await syncPermitNoteStateToDrive(refreshed, permit, updatedFile);
+          await clearOfflineSyncByTcNumber(cleanTc);
           setVisitedTick((t) => t + 1);
           showToast(`No Work / Pass (GPS Logged) synced to Google Drive (${cleanTc})`, 'success');
-        } catch {
+        } catch (err: any) {
+          await enqueueOfflineSync(cleanTc, 'NOTE', { tcNumber: cleanTc }, err?.message);
           showToast(
-            `No Work / Pass saved locally (${cleanTc}) — queued in Google Drive badge`,
+            `No Work / Pass saved locally (${cleanTc}) — queued for retry in Drive Sync`,
             'warning'
           );
         } finally {
           setQuickLoggingTc(null);
         }
       } else {
+        await enqueueOfflineSync(cleanTc, 'NOTE', { tcNumber: cleanTc }, 'Offline or Drive not connected');
         setQuickLoggingTc(null);
         showToast(
-          `No Work / Pass (GPS Logged: ${cleanTc}) — queued in Drive Sync badge`,
+          `No Work / Pass (GPS Logged: ${cleanTc}) — queued in Drive Sync`,
           'success'
         );
       }
     },
-    [accessToken, currentGps.lat, currentGps.lng, showToast]
+    [accessToken, currentGps.lat, currentGps.lng, isOnline, showToast]
   );
 
   // One-Tap Corridor Cluster 'Pass / No Work All' GPS Batch Logger
@@ -648,23 +733,41 @@ export default function App() {
             },
           ],
         };
-        saveLocalPermitNote(updatedFile);
+        const saveResult = saveLocalPermitNote(updatedFile);
+        if (!saveResult.ok) {
+          setStorageErrorMsg(saveResult.error || 'Storage full — export or sync logs now');
+          setBatchLoggingClusterId(null);
+          showToast(
+            saveResult.error || 'Storage full — corridor pass partially saved',
+            'warning'
+          );
+          return;
+        }
         updatedPairs.push({ permit, file: updatedFile });
       }
 
       setVisitedTick((t) => t + 1);
 
-      if (refreshedToken) {
+      if (refreshedToken && isOnline) {
         try {
           for (const pair of updatedPairs) {
             await syncPermitNoteStateToDrive(refreshedToken, pair.permit, pair.file);
+            await clearOfflineSyncByTcNumber(pair.permit.tcNumber.trim());
           }
           setVisitedTick((t) => t + 1);
           showToast(
             `Logged Pass / No Work across all ${cluster.totalCount} permits on ${cluster.corridorName} & synced to Spark Notes`,
             'success'
           );
-        } catch {
+        } catch (err: any) {
+          for (const pair of updatedPairs) {
+            await enqueueOfflineSync(
+              pair.permit.tcNumber.trim(),
+              'NOTE',
+              { tcNumber: pair.permit.tcNumber.trim() },
+              err?.message
+            );
+          }
           showToast(
             `Logged Pass / No Work across ${cluster.totalCount} permits on ${cluster.corridorName} — queued in Drive Sync`,
             'warning'
@@ -673,6 +776,14 @@ export default function App() {
           setBatchLoggingClusterId(null);
         }
       } else {
+        for (const pair of updatedPairs) {
+          await enqueueOfflineSync(
+            pair.permit.tcNumber.trim(),
+            'NOTE',
+            { tcNumber: pair.permit.tcNumber.trim() },
+            'Offline or Drive not connected'
+          );
+        }
         setBatchLoggingClusterId(null);
         showToast(
           `Logged Pass / No Work across all ${cluster.totalCount} permits on ${cluster.corridorName} — queued in Drive Sync`,
@@ -680,7 +791,7 @@ export default function App() {
         );
       }
     },
-    [accessToken, currentGps.lat, currentGps.lng, showToast]
+    [accessToken, currentGps.lat, currentGps.lng, isOnline, showToast]
   );
 
   // Auto-dismiss toast after 4.5 seconds
@@ -714,26 +825,33 @@ export default function App() {
   }, [inspectorSession, showToast]);
 
   // Interactive Draggable Mobile Bottom Sheet (< 768px) over Full-Screen Map
+  // Proportional heights ensure map + drawer always stay readable on short/narrow viewports
   const [workspaceHeight, setWorkspaceHeight] = useState<number>(() =>
-    typeof window !== 'undefined' ? Math.max(380, window.innerHeight - 120) : 660
+    typeof window !== 'undefined' ? Math.max(220, window.innerHeight - 128) : 640
   );
-  const peekHeight = 132;
-  const halfHeight = useMemo(
-    () => Math.max(250, Math.round(workspaceHeight * 0.52)),
+  const peekHeight = useMemo(
+    () => Math.min(112, Math.max(68, Math.round(workspaceHeight * 0.22))),
     [workspaceHeight]
+  );
+  const halfHeight = useMemo(
+    () =>
+      Math.min(
+        Math.round(workspaceHeight * 0.56),
+        Math.max(peekHeight + 44, Math.round(workspaceHeight * 0.46))
+      ),
+    [workspaceHeight, peekHeight]
   );
   const fullHeight = useMemo(
-    () => Math.max(340, Math.round(workspaceHeight * 0.92)),
-    [workspaceHeight]
+    () => Math.max(halfHeight + 40, Math.round(workspaceHeight * 0.88)),
+    [workspaceHeight, halfHeight]
   );
 
   const sheetPanelRef = React.useRef<HTMLElement | null>(null);
-  const [sheetHeightPx, setSheetHeightPx] = useState<number>(() =>
-    Math.max(
-      250,
-      Math.round((typeof window !== 'undefined' ? Math.max(380, window.innerHeight - 120) : 660) * 0.52)
-    )
-  );
+  const [sheetHeightPx, setSheetHeightPx] = useState<number>(() => {
+    const initialWorkspace =
+      typeof window !== 'undefined' ? Math.max(220, window.innerHeight - 128) : 640;
+    return Math.round(initialWorkspace * 0.46);
+  });
   const [isDraggingSheet, setIsDraggingSheet] = useState<boolean>(false);
 
   useLayoutEffect(() => {
@@ -753,7 +871,7 @@ export default function App() {
   }>({
     pointerId: null,
     startY: 0,
-    startHeight: 340,
+    startHeight: 300,
     lastY: 0,
     lastTime: 0,
     velocityY: 0,
@@ -766,10 +884,11 @@ export default function App() {
 
     const updateBounds = () => {
       const measured = el.getBoundingClientRect().height;
-      if (measured > 200) {
+      if (measured > 80) {
         setWorkspaceHeight(measured);
-        const maxH = Math.max(340, Math.round(measured * 0.92));
-        setSheetHeightPx((prev) => Math.min(maxH, Math.max(peekHeight, prev)));
+        const minH = Math.min(112, Math.max(68, Math.round(measured * 0.22)));
+        const maxH = Math.max(minH + 60, Math.round(measured * 0.88));
+        setSheetHeightPx((prev) => Math.min(maxH, Math.max(minH, prev)));
       }
     };
 
@@ -783,7 +902,7 @@ export default function App() {
       window.addEventListener('resize', updateBounds);
       return () => window.removeEventListener('resize', updateBounds);
     }
-  }, [peekHeight]);
+  }, []);
 
   const snapSheetTo = useCallback(
     (target: 'peek' | 'half' | 'full') => {
@@ -974,19 +1093,42 @@ export default function App() {
 
   const stopGpsWatching = useCallback(() => {
     if (watchIdRef.current !== null) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
-      watchIdRef.current = null;
-      setActiveWatchId(null);
+      try {
+        if (
+          typeof navigator !== 'undefined' &&
+          navigator.geolocation &&
+          typeof navigator.geolocation.clearWatch === 'function'
+        ) {
+          navigator.geolocation.clearWatch(watchIdRef.current);
+        }
+      } catch (err) {
+        console.warn('Geolocation clearWatch warning:', err);
+      } finally {
+        watchIdRef.current = null;
+        setActiveWatchId(null);
+      }
     }
   }, []);
 
   const startGpsWatching = useCallback(() => {
-    if (typeof window === 'undefined' || !navigator.geolocation) {
+    if (
+      typeof window === 'undefined' ||
+      typeof navigator === 'undefined' ||
+      !('geolocation' in navigator) ||
+      !navigator.geolocation ||
+      typeof navigator.geolocation.watchPosition !== 'function'
+    ) {
       return;
     }
 
     if (watchIdRef.current !== null) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
+      try {
+        if (typeof navigator.geolocation.clearWatch === 'function') {
+          navigator.geolocation.clearWatch(watchIdRef.current);
+        }
+      } catch {
+        // Ignore clearWatch errors in sandboxed iframes
+      }
       watchIdRef.current = null;
       setActiveWatchId(null);
     }
@@ -1031,7 +1173,7 @@ export default function App() {
           });
         },
         (err) => {
-          console.warn('Geolocation fallback:', err.message);
+          console.warn('Geolocation fallback:', err?.message || err);
         },
         {
           enableHighAccuracy: true,
@@ -1067,11 +1209,11 @@ export default function App() {
       lng: number,
       bounds?: { minLat: number; maxLat: number; minLng: number; maxLng: number }
     ) => {
-      if (!navigator.onLine) {
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
         setRitSyncStatus('offline');
         const cached = getCachedPermitsLocally();
         if (cached && cached.length > 0) {
-          setAllPermits(cached);
+          setAllPermits(cached.map((p) => normalizePermitExpirationStatus(p)));
         }
         return;
       }
@@ -1105,25 +1247,20 @@ export default function App() {
                   !ritPermit.location ||
                   ritPermit.location.includes('•') ||
                   ritPermit.location.includes('Maricopa County ROW');
-                const ritHasGenericContractor =
-                  !ritPermit.contractor ||
-                  ritPermit.contractor === 'Permittee / General Contractor' ||
-                  ritPermit.contractor === 'Commercial / Residential Developer';
 
                 map.set(cleanTc, {
                   ...knownInitial,
                   ...ritPermit,
                   location: ritHasGenericLoc ? knownInitial.location : ritPermit.location,
-                  contractor: ritHasGenericContractor
-                    ? knownInitial.contractor
-                    : ritPermit.contractor,
+                  contractor: ritPermit.contractor || knownInitial.contractor,
                   projectTitle:
                     !ritPermit.projectTitle ||
                     ritPermit.projectTitle === 'Right-of-Way Permit Work' ||
                     ritPermit.projectTitle === 'Driveway'
                       ? knownInitial.projectTitle
                       : ritPermit.projectTitle,
-                  issueDate: knownInitial.issueDate || ritPermit.issueDate,
+                  issueDate: ritPermit.issueDate ?? knownInitial.issueDate,
+                  expirationDate: ritPermit.expirationDate ?? knownInitial.expirationDate,
                 });
               } else {
                 map.set(cleanTc, ritPermit);
@@ -1144,7 +1281,9 @@ export default function App() {
               }
             });
 
-            const mergedAll = Array.from(map.values());
+            const mergedAll = Array.from(map.values()).map((p) =>
+              normalizePermitExpirationStatus(p)
+            );
             cachePermitsLocally(mergedAll);
             return mergedAll;
           });
@@ -1156,7 +1295,7 @@ export default function App() {
         setRitSyncStatus('offline');
         const cached = getCachedPermitsLocally();
         if (cached && cached.length > 0) {
-          setAllPermits(cached);
+          setAllPermits(cached.map((p) => normalizePermitExpirationStatus(p)));
         }
       }
     },
@@ -1205,7 +1344,7 @@ export default function App() {
   }, [allPermits, activeOnly]);
 
   const closestPermits = useMemo(() => {
-    return getTenClosestPermits(activeOrigin.lat, activeOrigin.lng, candidatePermits);
+    return getNearestPermits(activeOrigin.lat, activeOrigin.lng, candidatePermits);
   }, [activeOrigin.lat, activeOrigin.lng, candidatePermits]);
 
   const displayedPermits = useMemo(() => {
@@ -1218,10 +1357,10 @@ export default function App() {
         .filter(
           (p) =>
             p.tcNumber.toLowerCase().includes(q) ||
-            p.projectTitle.toLowerCase().includes(q) ||
-            p.contractor.toLowerCase().includes(q) ||
+            (p.projectTitle || '').toLowerCase().includes(q) ||
+            (p.contractor || '').toLowerCase().includes(q) ||
             (p.contractorContact || '').toLowerCase().includes(q) ||
-            p.location.toLowerCase().includes(q)
+            (p.location || '').toLowerCase().includes(q)
         )
         .map((p) => ({
           ...p,
@@ -1601,24 +1740,25 @@ export default function App() {
             id: noteFile.permitId || cleanTc,
             tcNumber: cleanTc,
             projectTitle: cleanTc,
-            contractor: extractedFromSync[0]?.company || '',
-            contractorPhone: extractedFromSync[0]?.phone || '',
+            contractor: extractedFromSync[0]?.company || null,
+            contractorPhone: extractedFromSync[0]?.phone || null,
             location: '',
             permitType: 'Trench / Utility',
-            status: 'Active',
-            issueDate: new Date().toISOString(),
-            expirationDate: new Date().toISOString(),
+            status: 'Unknown',
+            issueDate: null,
+            expirationDate: null,
             lat: currentGps.lat,
             lng: currentGps.lng,
-            workWindow: '',
+            workWindow: null,
             trafficControlPlan: '',
             specialConditions: [],
-            preConCompleted: false,
+            preConCompleted: null,
             hasSignInSheet: false,
             hasBusinessCards: false,
           };
 
         const summary = await syncPermitNoteStateToDrive(activeToken, matchedPermit, noteFile);
+        await clearOfflineSyncByTcNumber(cleanTc);
         syncedCount++;
         lastFolder = {
           folderId: summary.folderId,
@@ -1696,24 +1836,25 @@ export default function App() {
             id: noteFile.permitId || cleanTc,
             tcNumber: cleanTc,
             projectTitle: cleanTc,
-            contractor: extracted[0]?.company || '',
-            contractorPhone: extracted[0]?.phone || '',
+            contractor: extracted[0]?.company || null,
+            contractorPhone: extracted[0]?.phone || null,
             location: '',
             permitType: 'Trench / Utility',
-            status: 'Active',
-            issueDate: new Date().toISOString(),
-            expirationDate: new Date().toISOString(),
+            status: 'Unknown',
+            issueDate: null,
+            expirationDate: null,
             lat: currentGps.lat,
             lng: currentGps.lng,
-            workWindow: '',
+            workWindow: null,
             trafficControlPlan: '',
             specialConditions: [],
-            preConCompleted: false,
+            preConCompleted: null,
             hasSignInSheet: false,
             hasBusinessCards: false,
           };
 
         const summary = await syncPermitNoteStateToDrive(activeToken, matchedPermit, noteFile);
+        await clearOfflineSyncByTcNumber(cleanTc);
         pushed++;
         lastFolder = {
           folderId: summary.folderId,
@@ -1742,6 +1883,26 @@ export default function App() {
       setSyncAllProgress(null);
     }
   };
+
+  // Auto-retry queued offline Drive uploads when connectivity + valid Drive token return
+  const autoRetryTriggeredKeyRef = React.useRef<string>('');
+  useEffect(() => {
+    if (!isOnline || !accessToken || !hasValidCachedDriveToken(accessToken)) {
+      autoRetryTriggeredKeyRef.current = '';
+      return;
+    }
+    if (isSyncingAllNotes || queuedSyncTcs.size === 0) return;
+
+    const retryKey = `${Array.from(queuedSyncTcs).sort().join(',')}`;
+    if (autoRetryTriggeredKeyRef.current === retryKey) return;
+    autoRetryTriggeredKeyRef.current = retryKey;
+
+    const timer = setTimeout(() => {
+      void handleSyncUnsyncedItems(accessToken);
+    }, 1200);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOnline, accessToken, queuedSyncTcs, isSyncingAllNotes]);
 
   // Unified Zero-Chrome Drive Sync Modal Trigger
   const handleDriveBadgeClick = () => {
@@ -2523,10 +2684,10 @@ export default function App() {
   );
 
   return (
-    <div className="flex flex-col h-screen w-screen overflow-hidden bg-zinc-100 dark:bg-[#05080F] text-[#09090B] dark:text-slate-100 font-sans safe-top safe-bottom safe-left safe-right">
+    <div className="flex flex-col h-[100dvh] w-full overflow-hidden bg-zinc-100 dark:bg-[#05080F] text-[#09090B] dark:text-slate-100 font-sans safe-top safe-bottom safe-left safe-right">
       {/* 1. Google Maps Demo Quota Reached Warning Banner */}
       {quotaExceeded && (
-        <div className="bg-amber-50 border-b border-amber-300 text-amber-950 px-4 py-2 text-xs md:text-sm text-center sticky top-0 z-50 shadow-sm flex items-center justify-center gap-2">
+        <div className="bg-amber-50 border-b border-amber-300 text-amber-950 px-4 py-2 text-xs md:text-sm text-center shrink-0 z-50 shadow-sm flex items-center justify-center gap-2">
           <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
           <span>
             Google Maps Platform quota reached. If you are the app owner, visit{' '}
@@ -2540,6 +2701,36 @@ export default function App() {
             </a>{' '}
             for instructions to update your account.
           </span>
+        </div>
+      )}
+
+      {/* 1b. Storage Quota / Write Failure Red Alert Banner */}
+      {storageErrorMsg && (
+        <div
+          role="alert"
+          className="bg-rose-600 text-white border-b-2 border-rose-900 px-3 py-2 text-xs font-black shrink-0 z-50 flex items-center justify-between gap-2"
+        >
+          <div className="flex items-center gap-2 min-w-0">
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+            <span className="truncate">{storageErrorMsg}</span>
+          </div>
+          <div className="flex items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={handleDriveBadgeClick}
+              className="px-2.5 py-1 rounded-lg bg-white text-rose-700 hover:bg-rose-50 font-black text-[11px] cursor-pointer"
+            >
+              Sync / Export
+            </button>
+            <button
+              type="button"
+              onClick={() => setStorageErrorMsg(null)}
+              className="p-1 rounded hover:bg-rose-700 cursor-pointer"
+              aria-label="Dismiss storage alert"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
         </div>
       )}
 
@@ -2654,38 +2845,7 @@ export default function App() {
             )}
           </button>
 
-          {/* Unified Zero-Chrome 'Drive Sync' Button (opens Drive Sync Modal directly) */}
-          <button
-            type="button"
-            onClick={handleDriveBadgeClick}
-            className={`min-h-[44px] h-11 flex items-center justify-center gap-1.5 px-2.5 sm:px-3 py-2 rounded-xl text-xs font-black border-2 transition cursor-pointer select-none shrink-0 ${
-              isSyncingAllNotes
-                ? 'bg-sky-50 dark:bg-sky-950 border-[#0284C7] text-[#09090B] dark:text-sky-100'
-                : unsyncedNoteCount > 0
-                ? 'bg-amber-100 dark:bg-amber-950/95 border-[#F59E0B] text-[#09090B] dark:text-amber-100'
-                : accessToken && hasValidCachedDriveToken(accessToken)
-                ? 'bg-emerald-50 dark:bg-emerald-950/90 border-[#16A34A] text-[#09090B] dark:text-emerald-100'
-                : 'bg-zinc-100 dark:bg-slate-800 border-zinc-400 dark:border-slate-600 text-[#09090B] dark:text-white'
-            }`}
-            title="Drive Sync & Google OAuth Setup"
-          >
-            {isSyncingAllNotes ? (
-              <RefreshCw className="w-4 h-4 text-[#0284C7] animate-spin shrink-0" />
-            ) : (
-              <CloudUpload className="w-4 h-4 text-[#0284C7] dark:text-sky-400 shrink-0" />
-            )}
-            <span className="hidden md:inline">Drive Sync</span>
-            {unsyncedNoteCount > 0 ? (
-              <span className="text-xs font-mono tabular-nums font-black px-1.5 py-0.5 rounded bg-[#F59E0B] text-[#09090B]">
-                {unsyncedNoteCount}
-              </span>
-            ) : (
-              accessToken &&
-              hasValidCachedDriveToken(accessToken) && (
-                <Check className="w-3.5 h-3.5 text-[#16A34A] dark:text-emerald-400 shrink-0" />
-              )
-            )}
-          </button>
+          {/* Drive Sync button is docked once in the ergonomic control bar (no duplicate header badge) */}
 
           {/* Inspector Shift SSO Badge */}
           {inspectorSession ? (
@@ -2725,7 +2885,7 @@ export default function App() {
         className="flex-1 flex flex-col md:flex-row relative overflow-hidden min-h-0"
       >
         {/* LEFT PANE on >= 768px (Permanently Locked Interactive Hybrid Map) / Full-Bleed Map on < 768px */}
-        <main className="flex-1 md:flex-none md:w-[46%] lg:w-[48%] xl:w-[50%] relative h-full min-w-0 z-0 md:border-r-2 md:border-zinc-400 dark:md:border-slate-800">
+        <main className="flex-1 min-h-0 md:flex-none md:w-[46%] lg:w-[48%] xl:w-[50%] relative min-w-0 z-0 md:border-r-2 md:border-zinc-400 dark:md:border-slate-800">
           {hasMapsApiKey ? (
             <APIProvider apiKey={MAPS_API_KEY}>{mapNode}</APIProvider>
           ) : (
@@ -2746,7 +2906,7 @@ export default function App() {
             <button
               type="button"
               onClick={() => handleOpenHoldToSpeakFor()}
-              className="md:hidden absolute right-3 bottom-[148px] z-20 min-h-[52px] px-4 py-2.5 rounded-full bg-[#16A34A] hover:bg-emerald-700 text-white border-2 border-[#09090B] shadow-xl font-black text-xs flex items-center gap-2 cursor-pointer select-none"
+              className="md:hidden absolute right-3 bottom-[124px] z-20 min-h-[52px] px-4 py-2.5 rounded-full bg-[#16A34A] hover:bg-emerald-700 text-white border-2 border-[#09090B] shadow-xl font-black text-xs flex items-center gap-2 cursor-pointer select-none"
             >
               <Mic className="w-4 h-4 shrink-0" />
               <span>Hold-to-Speak AI Log</span>

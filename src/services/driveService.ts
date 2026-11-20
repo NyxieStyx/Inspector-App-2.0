@@ -17,6 +17,12 @@ import {
 } from '../utils/docxExport';
 import { getMaricopaSealPngBytes } from '../assets/maricopaSeal';
 import { clearCachedToken } from './firebaseAuth';
+import {
+  StorageWriteResult,
+  isQuotaExceededError,
+  notifyStorageError,
+  migrateDataUrlToPhotoBlob,
+} from './offlineStorage';
 
 const LOCAL_STORAGE_PREFIX = 'mcdot_permit_notes_';
 const PRECON_STORAGE_PREFIX = 'mcdot_precon_contact_';
@@ -1006,19 +1012,19 @@ export async function updatePermitNoteInDrive(
     id: noteData.permitId || cleanTc,
     tcNumber: cleanTc,
     projectTitle: cleanTc,
-    contractor: '',
-    contractorPhone: '',
+    contractor: null,
+    contractorPhone: null,
     location: '',
     permitType: 'Trench / Utility',
-    status: 'Active',
-    issueDate: syncedAt,
-    expirationDate: syncedAt,
+    status: 'Unknown',
+    issueDate: null,
+    expirationDate: null,
     lat: 33.4484,
     lng: -112.074,
-    workWindow: '',
+    workWindow: null,
     trafficControlPlan: '',
     specialConditions: [],
-    preConCompleted: false,
+    preConCompleted: null,
     hasSignInSheet: false,
     hasBusinessCards: false,
   };
@@ -1224,8 +1230,22 @@ export function getLocalPermitNote(tcNumber: string): PermitNoteFile | null {
   }
 }
 
-export function saveLocalPermitNote(noteFile: PermitNoteFile) {
+export function saveLocalPermitNote(noteFile: PermitNoteFile): StorageWriteResult {
   try {
+    // Strip heavy base64 dataUrl payloads from localStorage JSON; photos live as Blobs in IndexedDB
+    const lightweightPhotos = Array.isArray(noteFile.photos)
+      ? noteFile.photos.map((photo) => {
+          if (photo.dataUrl) {
+            void migrateDataUrlToPhotoBlob(photo.id, photo.dataUrl);
+          }
+          const { dataUrl: _omitted, ...metaOnly } = photo;
+          return {
+            ...metaOnly,
+            storedInIdb: true,
+          };
+        })
+      : [];
+
     const sanitized: PermitNoteFile = {
       ...noteFile,
       inspectorNotes: Array.isArray(noteFile.inspectorNotes)
@@ -1234,13 +1254,21 @@ export function saveLocalPermitNote(noteFile: PermitNoteFile) {
             text: stripLogRowDecorations(n.text || ''),
           }))
         : [],
+      photos: lightweightPhotos,
     };
     localStorage.setItem(
       LOCAL_STORAGE_PREFIX + noteFile.tcNumber.trim(),
       JSON.stringify(sanitized)
     );
-  } catch (e) {
+    return { ok: true };
+  } catch (e: any) {
+    const isQuota = isQuotaExceededError(e);
+    const errorMsg = isQuota
+      ? 'Storage full — export or sync logs now'
+      : `Could not save permit log locally: ${e?.message || 'Storage write failed'}`;
     console.warn('LocalStorage save failed:', e);
+    notifyStorageError(errorMsg, isQuota);
+    return { ok: false, error: errorMsg, isQuotaError: isQuota };
   }
 }
 

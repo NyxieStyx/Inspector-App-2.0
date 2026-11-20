@@ -196,7 +196,7 @@ export default function TodaysRouteLogModal({
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-800 font-medium">
                   <span>
                     <strong className="text-gray-900 font-bold">Contractor:</strong>{' '}
-                    {rec.permit.contractor}
+                    {rec.permit.contractor || 'Not Listed in GIS'}
                   </span>
                   <span>
                     <strong className="text-gray-900 font-bold">Scope:</strong>{' '}

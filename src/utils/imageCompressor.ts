@@ -7,7 +7,7 @@ export async function compressImage(
   file: File | Blob,
   maxDimension = 1280,
   quality = 0.82
-): Promise<{ dataUrl: string; fileSizeKb: number; width: number; height: number }> {
+): Promise<{ blob: Blob; dataUrl: string; fileSizeKb: number; width: number; height: number }> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error('Failed to read image file'));
@@ -42,19 +42,40 @@ export async function compressImage(
         ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(img, 0, 0, width, height);
 
-        // Convert to compressed JPEG data URL
-        const dataUrl = canvas.toDataURL('image/jpeg', quality);
+        // Convert to compressed JPEG Blob for IndexedDB storage
+        canvas.toBlob(
+          (blob) => {
+            const dataUrl = canvas.toDataURL('image/jpeg', quality);
+            if (!blob) {
+              // Fallback conversion from dataUrl if canvas.toBlob returns null
+              const parts = dataUrl.split(',');
+              const byteStr = atob(parts[1] || '');
+              const bytes = new Uint8Array(byteStr.length);
+              for (let i = 0; i < byteStr.length; i++) {
+                bytes[i] = byteStr.charCodeAt(i);
+              }
+              const fallbackBlob = new Blob([bytes], { type: 'image/jpeg' });
+              resolve({
+                blob: fallbackBlob,
+                dataUrl,
+                fileSizeKb: Math.max(1, Math.round(fallbackBlob.size / 1024)),
+                width,
+                height,
+              });
+              return;
+            }
 
-        // Calculate approximate file size in KB from base64 string
-        const base64Length = dataUrl.length - (dataUrl.indexOf(',') + 1);
-        const fileSizeKb = Math.round((base64Length * 3) / 4 / 1024);
-
-        resolve({
-          dataUrl,
-          fileSizeKb,
-          width,
-          height,
-        });
+            resolve({
+              blob,
+              dataUrl,
+              fileSizeKb: Math.max(1, Math.round(blob.size / 1024)),
+              width,
+              height,
+            });
+          },
+          'image/jpeg',
+          quality
+        );
       };
       img.src = e.target?.result as string;
     };

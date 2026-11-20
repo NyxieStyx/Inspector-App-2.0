@@ -1662,7 +1662,7 @@ export default function PermitMap({
         />
       )}
 
-      {/* Top-Left Map Controls: Re-Center GPS + 150m Auto-Arrival Test Trigger */}
+      {/* Top-Left Map Controls: Re-Center GPS */}
       <div className="absolute top-3 left-3 z-10 flex items-center gap-2 flex-wrap">
         <button
           type="button"
@@ -1676,28 +1676,6 @@ export default function PermitMap({
           <LocateFixed className="w-4 h-4 text-blue-700 dark:text-blue-400 shrink-0" />
           <span>Re-center GPS</span>
         </button>
-
-        {onToggleSimulatedArrival && (
-          <button
-            type="button"
-            onClick={onToggleSimulatedArrival}
-            className={`min-h-[44px] h-11 px-3 py-2 rounded-xl border-2 shadow-md flex items-center gap-1.5 text-xs font-extrabold transition cursor-pointer select-none whitespace-nowrap ${
-              isSimulatedArrival
-                ? 'bg-emerald-700 hover:bg-emerald-600 text-white border-emerald-900 dark:border-emerald-400'
-                : 'bg-white/95 hover:bg-emerald-50 dark:bg-slate-900/95 dark:hover:bg-slate-800 text-[#090D16] dark:text-slate-100 border-slate-300 dark:border-slate-700'
-            }`}
-            title="Simulate entering 150m geofence around closest permit to test On-Site Auto-Arrival Hero Card"
-          >
-            <MapPin
-              className={`w-4 h-4 shrink-0 ${
-                isSimulatedArrival
-                  ? 'text-emerald-200'
-                  : 'text-emerald-700 dark:text-emerald-400'
-              }`}
-            />
-            <span>{isSimulatedArrival ? '150m Arrival ON' : 'Test 150m Arrival'}</span>
-          </button>
-        )}
       </div>
 
       {/* Top-Right Map Layer & View Controls */}
@@ -1709,7 +1687,11 @@ export default function PermitMap({
           title="Toggle visibility of surrounding sector permits"
         >
           <Layers className="w-4 h-4 text-blue-700 dark:text-emerald-400 shrink-0" />
-          <span>{showAllSectorPermits ? `All (${permits.length})` : 'Top 10'}</span>
+          <span>
+            {showAllSectorPermits
+              ? `All (${permits.length})`
+              : `Nearest (${closestPermits.length})`}
+          </span>
         </button>
 
         <button

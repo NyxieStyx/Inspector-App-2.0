@@ -134,10 +134,14 @@ export default function OnSiteHeroCard({
       <div className="flex items-center justify-between gap-2.5 px-3 py-2 rounded-xl bg-zinc-100 dark:bg-slate-900 border-2 border-zinc-300 dark:border-slate-700">
         <div className="min-w-0 flex-1 text-xs sm:text-sm font-bold text-[#09090B] dark:text-slate-100 truncate">
           <span className="font-black">{resolvedContact.companyName}</span>
-          <span className="text-zinc-400 mx-1.5">·</span>
-          <span className="text-zinc-700 dark:text-slate-300">
-            {resolvedContact.contactName || 'Supt.'}
-          </span>
+          {resolvedContact.contactName && (
+            <>
+              <span className="text-zinc-400 mx-1.5">·</span>
+              <span className="text-zinc-700 dark:text-slate-300">
+                {resolvedContact.contactName}
+              </span>
+            </>
+          )}
         </div>
 
         {resolvedContact.cleanPhone && (
