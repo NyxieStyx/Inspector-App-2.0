@@ -1,0 +1,11 @@
+{
+  "name": "MCDOT Inspector AI - Maricopa County ROW Permits",
+  "description": "AI assistant for Maricopa County Transportation Inspectors to track right-of-way permits, navigate with real-time GPS, manage permit notes in Google Drive, voice-dictate field status updates, and intelligently transcribe pre-con meetings.",
+  "requestFramePermissions": [
+    "geolocation",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
